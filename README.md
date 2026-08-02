@@ -1,6 +1,8 @@
 # 军棋复盘解析及统计
 
-[下载地址](https://github.com/math-yyj/JQ_Replay_Stat/releases/tag/v0.2)
+[github下载地址](https://github.com/math-yyj/JQ_Replay_Stat/releases/tag/v0.2)
+
+[百度网盘分流下载地址] https://pan.baidu.com/s/1GJ4obTjLguZXpFZO53tE0Q?pwd=cd3r 提取码: cd3r
 
 本程序基于以下项目进行二次开发
   
