@@ -1,0 +1,87 @@
+# myjgs Python 实现
+# 由 C++ 工程 myjgs (https://github.com/windsgo/myjgs) 转换而来
+# QQ 四国军棋 .jgs 复盘文件解析与棋局推演
+
+from .jgs_types import (
+    EventType,
+    GameException,
+    InfoGameOverType,
+    InfoResultType,
+    ItemColor,
+    ItemType,
+    MoveResultType,
+    PlayerColor,
+    Position,
+    event_moveresult2string,
+    event_type2string,
+    item_score,
+    item_type2string,
+    itemcolor_type2string,
+    set_item_score,
+)
+from .block import (
+    EVENT_BLOCK_SIZE,
+    HEADER_BLOCK_SIZE,
+    PLAYER_INFO_BLOCK_SIZE,
+    TOTAL_INFO_BLOCK_SIZE,
+    JGSEventBlock,
+    JGSHeaderBlock,
+    JGSLayoutBlock,
+    JGSPlayerInfoBlock,
+    JGSTotalInfoBlock,
+)
+from .item import Item
+from .player import Player
+from .game import Game
+from .layout_stats import (
+    COLOR_SELECTORS,
+    FIXED_COLOR_SELECTORS,
+    MOVE_ORDER,
+    LayoutStats,
+    find_jgs_files,
+    load_layouts,
+    load_total_info,
+    next_mover,
+    partner,
+    prev_mover,
+)
+
+__all__ = [
+    "EventType",
+    "GameException",
+    "InfoGameOverType",
+    "InfoResultType",
+    "ItemColor",
+    "ItemType",
+    "MoveResultType",
+    "PlayerColor",
+    "Position",
+    "event_moveresult2string",
+    "event_type2string",
+    "item_score",
+    "item_type2string",
+    "itemcolor_type2string",
+    "set_item_score",
+    "EVENT_BLOCK_SIZE",
+    "HEADER_BLOCK_SIZE",
+    "PLAYER_INFO_BLOCK_SIZE",
+    "TOTAL_INFO_BLOCK_SIZE",
+    "JGSEventBlock",
+    "JGSHeaderBlock",
+    "JGSLayoutBlock",
+    "JGSPlayerInfoBlock",
+    "JGSTotalInfoBlock",
+    "Item",
+    "Player",
+    "Game",
+    "LayoutStats",
+    "find_jgs_files",
+    "load_layouts",
+    "load_total_info",
+    "COLOR_SELECTORS",
+    "FIXED_COLOR_SELECTORS",
+    "MOVE_ORDER",
+    "next_mover",
+    "prev_mover",
+    "partner",
+]
