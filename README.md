@@ -1,3 +1,7 @@
+# 军棋复盘解析及统计
+
+[下载地址](https://github.com/math-yyj/JQ_Replay_Stat/releases/tag/v0.2)
+
 本程序基于以下项目进行二次开发
   
 https://github.com/windsgo/myjgs
