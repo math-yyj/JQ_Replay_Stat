@@ -1,14 +1,10 @@
 # 军棋复盘解析及统计
 
-[github下载地址](https://github.com/math-yyj/JQ_Replay_Stat/releases/tag/v0.2)
+[github下载地址](https://github.com/math-yyj/JQ_Replay_Stat/releases/tag/v0.2.1)
 
-[百度网盘分流下载地址] https://pan.baidu.com/s/1GJ4obTjLguZXpFZO53tE0Q?pwd=cd3r 提取码: cd3r
-
-本程序基于以下项目进行二次开发
+[百度网盘分流下载地址](https://pan.baidu.com/s/1YQEiOp6oZ0YCsdE8RJdsGQ?pwd=1v4v)
   
-https://github.com/windsgo/myjgs
-
-感谢 [windsgo](https://github.com/windsgo) 的先行工作！
+感谢 [@windsgo](https://github.com/windsgo) 的[先行工作](https://github.com/windsgo/myjgs)！
 
 ## 已支持功能
 
