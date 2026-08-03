@@ -133,11 +133,17 @@ class StatPanel(ttk.Frame):
         self.export_btn.config(state=tk.DISABLED)
         self.summary_var.set("统计中……")
 
+        total_files_ref = [0]  # 用列表以便闭包修改
+
+        def progress_callback(done, total):
+            total_files_ref[0] = total
+            self.summary_var.set(f"统计中…… {done}/{total}")
+
         # 后台线程统计, 避免大量文件时界面卡死
         def worker():
             stats = LayoutStats()
             try:
-                files = stats.add_folder(folder, selector, predicate)
+                files = stats.add_folder(folder, selector, predicate, progress_callback)
                 self._result = (stats, len(files), None)
             except Exception as e:  # 兜底, 正常失败已被 add_folder 记录
                 self._result = (None, 0, str(e))
@@ -174,23 +180,29 @@ class StatPanel(ttk.Frame):
                    f"统计布阵数: {stats.layout_count}")
         self.summary_var.set(summary)
         self.export_btn.config(state=tk.NORMAL)
-        if skipped:
-            detail = "\n".join(stats.skipped_1v1_files[:20])
-            if skipped > 20:
-                detail += f"\n……共 {skipped} 个"
-            messagebox.showinfo(
-                "已跳过 1v1(单挑) 复盘",
-                f"以下 {skipped} 个复盘只有两家布阵(1v1), 未计入统计:\n\n{detail}")
-        if abnormal:
-            detail = "\n".join(f"{f}\n  {r}" for f, r in stats.skipped_abnormal_files[:20])
-            if abnormal > 20:
-                detail += f"\n……共 {abnormal} 个"
-            messagebox.showwarning(
-                "已跳过异常复盘",
-                f"以下 {abnormal} 个复盘布阵校验不通过, 未计入统计:\n\n{detail}")
-        if failed:
-            detail = "\n".join(f"{f}: {r}" for f, r in stats.failed_files[:20])
-            messagebox.showwarning("部分文件解析失败", detail)
+
+        # 合并异常提示
+        if skipped or abnormal or failed:
+            parts = []
+            if skipped:
+                paths = [str(Path(f).name) for f in stats.skipped_1v1_files[:10]]
+                block = "\n".join(paths)
+                if skipped > 10:
+                    block += f"\n……共 {skipped} 个"
+                parts.append(f"【跳过1v1({skipped})】\n{block}")
+            if abnormal:
+                paths = [str(Path(f).name) for f, _ in stats.skipped_abnormal_files[:10]]
+                block = "\n".join(paths)
+                if abnormal > 10:
+                    block += f"\n……共 {abnormal} 个"
+                parts.append(f"【跳过异常({abnormal})】\n{block}")
+            if failed:
+                paths = [str(Path(f).name) for f, _ in stats.failed_files[:10]]
+                block = "\n".join(paths)
+                if failed > 10:
+                    block += f"\n……共 {failed} 个"
+                parts.append(f"【解析失败({failed})】\n{block}")
+            messagebox.showwarning("部分复盘未计入统计", "\n\n".join(parts))
 
     def _refresh_grid(self) -> None:
         """刷新网格"""
@@ -346,10 +358,13 @@ class LianzhongPanel(StatPanel):
         from src.lianzhong import get_char_to_itemtype
         c2i = get_char_to_itemtype()
 
+        def progress_callback(done, total):
+            self.summary_var.set(f"统计中…… {done}/{total}")
+
         def worker():
             stats = LayoutStats()
             try:
-                files = stats.add_jqh_folder(folder, chosen_colors, c2i)
+                files = stats.add_jqh_folder(folder, chosen_colors, c2i, progress_callback)
                 self._result = (stats, len(files), None)
             except Exception as e:
                 self._result = (None, 0, str(e))
@@ -420,6 +435,9 @@ class PieceFilterPanel(StatPanel):
 
         is_lianzhong = self._source_var is not None and self._source_var.get() == "联众"
 
+        def progress_callback(done, total):
+            self.summary_var.set(f"统计中…… {done}/{total}")
+
         def worker():
             stats = LayoutStats()
             try:
@@ -427,9 +445,9 @@ class PieceFilterPanel(StatPanel):
                     from src.lianzhong import get_char_to_itemtype
                     c2i = get_char_to_itemtype()
                     colors = {"红", "绿", "蓝", "黑"}
-                    files = stats.add_jqh_folder(folder, colors, c2i)
+                    files = stats.add_jqh_folder(folder, colors, c2i, progress_callback)
                 else:
-                    files = stats.add_folder(folder)
+                    files = stats.add_folder(folder, progress_callback=progress_callback)
                 self._result = (stats, len(files), None)
             except Exception as e:
                 self._result = (None, 0, str(e))

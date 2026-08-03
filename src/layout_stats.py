@@ -87,6 +87,29 @@ def _layout_is_empty(layout: JGSLayoutBlock) -> bool:
     )
 
 
+# 合法棋子类型集合 (含空位 JQNone)
+_VALID_PIECES = set(ItemType)
+
+
+def _layout_has_invalid_piece(layout: JGSLayoutBlock) -> str | None:
+    """检查布阵非行营位置: 含空位/非法棋子/缺少军旗 均返回错误信息, 合法返回 None"""
+    has_flag = False
+    for row in range(JGSLayoutBlock.row_num):
+        for col in range(JGSLayoutBlock.col_num):
+            if (row, col) in CAMP_POSITIONS:
+                continue
+            item = layout.item(row, col)
+            if item == ItemType.JQNone:
+                return f"位置({row},{col})为空"
+            if item not in _VALID_PIECES:
+                return f"位置({row},{col})出现未知棋子编码0x{item:02X}"
+            if item == ItemType.Junqi:
+                has_flag = True
+    if not has_flag:
+        return "布阵缺少军旗"
+    return None
+
+
 class LayoutStats:
     """布阵统计：每个位置(row, col)上各种子力的绝对频率与相对频率
 
@@ -163,7 +186,7 @@ class LayoutStats:
         self._layout_count += 1
 
     def add_jqh_folder(self, folder: str | os.PathLike, colors: set[str],
-                       char_to_itemtype: dict) -> list[str]:
+                       char_to_itemtype: dict, progress_callback=None) -> list[str]:
         """递归统计文件夹下所有 .jqh 文件的联众布阵, 返回文件列表。
 
         先解析全部四色布阵, 验证通过后按 colors 筛选计入统计。"""
@@ -173,7 +196,8 @@ class LayoutStats:
         ALL_COLORS = ["红", "绿", "蓝", "黑"]
         pattern = os.path.join(str(folder), "**", "*.jqh")
         files = sorted(glob.glob(pattern, recursive=True))
-        for jqh_file in files:
+        total = len(files)
+        for i, jqh_file in enumerate(files):
             try:
                 raw = open(jqh_file, "rb").read()
                 boards, color_grids = decode_jqh_all_boards(raw)
@@ -230,6 +254,8 @@ class LayoutStats:
                     self._failed_files.append((jqh_file, "四色布阵全空"))
             except (OSError, AssertionError, ValueError, KeyError) as e:
                 self._failed_files.append((jqh_file, str(e)))
+            if progress_callback:
+                progress_callback(i + 1, total)
         return files
 
     def add_file(self, jgs_file: str, color_selector=None, player_predicate=None) -> None:
@@ -249,9 +275,23 @@ class LayoutStats:
             self._skipped_1v1_files.append(jgs_file)
             return
 
+        # 非1v1时, 出现空布阵即标记异常
+        if active_count < 4:
+            self._skipped_abnormal_files.append((jgs_file, f"{4 - active_count}家布阵为空"))
+            return
+
+        # 检查是否有非法棋子
+        for pib in total_info.player_info_block:
+            err = _layout_has_invalid_piece(pib.player_layout)
+            if err:
+                self._skipped_abnormal_files.append((jgs_file, err))
+                return
+
         self_color = total_info.header_block.self_color
         colors = None if color_selector is None else color_selector(self_color)
         for pib in total_info.player_info_block:
+            if _layout_is_empty(pib.player_layout):
+                continue
             if colors is not None and pib.player_color not in colors:
                 continue
             if player_predicate is not None and not player_predicate(pib, self_color):
@@ -260,14 +300,17 @@ class LayoutStats:
         self._file_count += 1
 
     def add_folder(self, folder: str | os.PathLike, color_selector=None,
-                   player_predicate=None) -> list[str]:
+                   player_predicate=None, progress_callback=None) -> list[str]:
         """递归统计文件夹下所有 .jgs 文件，返回文件列表；解析失败的文件跳过并记录"""
         files = find_jgs_files(folder)
-        for jgs_file in files:
+        total = len(files)
+        for i, jgs_file in enumerate(files):
             try:
                 self.add_file(jgs_file, color_selector, player_predicate)
             except (GameException, OSError, AssertionError, ValueError) as e:
                 self._failed_files.append((jgs_file, str(e)))
+            if progress_callback:
+                progress_callback(i + 1, total)
         return files
 
     @property

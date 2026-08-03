@@ -419,48 +419,46 @@ def decode_jqh_all_boards(raw: bytes) -> dict[str, list[list[str]]]:
             col = gi % GRID_SIZE
             piece_positions.append((i, row, col))
 
-    # 累积 delta 解码
-    prev_b1 = seed_b1
+    # 累积 delta 解码 (zip 方式)
     COLORS = ['红', '绿', '蓝']
-    decoded = {}
-    for idx, (gi, row, col) in enumerate(piece_positions):
+    _BLACK_XOR_K_LIST = {
+        0x0C: [0x2B, 0x13], 0x10: [0x2B], 0x12: [0x2B],
+        0x14: [0x33], 0x1C: [0x33],
+        0x2C: [0x2B, 0x53], 0x6C: [0x53], 0xEC: [0x53],
+    }
+
+    def _decode_piece(prev_b1_val, gi, row, col):
         g = groups[gi]
         b0, b1 = g[0], g[1]
-        delta = (b1 - prev_b1) & 0xFF
-
-        best_piece = '?'
-        best_color = '?'
-
+        delta = (b1 - prev_b1_val) & 0xFF
         for color in COLORS:
             k = JQH_COLOR_K[color]
             code = (delta - k) & 0xFF
             if code <= 0x0C:
-                best_piece = JQS_CODE_MAP.get(code, '?')
-                best_color = color
-                break
+                return b1, (row, col), (color, JQS_CODE_MAP.get(code, '?'))
+        xor_val = b0 ^ b1
+        k_list = _BLACK_XOR_K_LIST.get(xor_val)
+        if k_list:
+            for k in k_list:
+                code = (delta - k) & 0xFF
+                if code <= 0x0C:
+                    return b1, (row, col), ('黑', JQS_CODE_MAP.get(code, '?'))
+        return b1, (row, col), ('?', '?')
 
-        if best_piece == '?':
-            xor_val = b0 ^ b1
-            _BLACK_XOR_K_LIST = {
-                0x0C: [0x2B, 0x13], 0x10: [0x2B], 0x12: [0x2B],
-                0x14: [0x33], 0x1C: [0x33],
-                0x2C: [0x2B, 0x53], 0x6C: [0x53], 0xEC: [0x53],
-            }
-            k_list = _BLACK_XOR_K_LIST.get(xor_val)
-            if k_list:
-                for k in k_list:
-                    code = (delta - k) & 0xFF
-                    if code <= 0x0C:
-                        best_piece = JQS_CODE_MAP.get(code, '?')
-                        best_color = '黑'
-                        break
+    # 构建 (prev_b1, gi, row, col) 序列, 用 zip 取相邻对
+    prev_list = [seed_b1] + [groups[gi][1] for gi, _, _ in piece_positions[:-1]]
+    gi_list = [gi for gi, _, _ in piece_positions]
+    row_list = [r for _, r, _ in piece_positions]
+    col_list = [c for _, _, c in piece_positions]
 
-        if best_piece == '空':
+    results = [_decode_piece(p, g, r, c)
+               for p, g, r, c in zip(prev_list, gi_list, row_list, col_list)]
+
+    decoded = {}
+    for _, (row, col), (color, piece) in results:
+        if piece == '空' or piece == '?':
             continue
-
-        if best_piece != '?':
-            decoded[(row, col)] = (best_color, best_piece)
-        prev_b1 = b1
+        decoded[(row, col)] = (color, piece)
 
     # 提取四家子方阵(同时提取棋子名和颜色)
     def extract_subgrid(row_range, col_range):
