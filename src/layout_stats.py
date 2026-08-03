@@ -95,37 +95,71 @@ class LayoutStats:
     """
 
     def __init__(self):
-        # _counts[row][col][ItemType] = 出现次数
+        # _counts[row][col][ItemType] = 出现次数 (左右旗合并, 等于 left+right)
         self._counts: list[list[dict[ItemType, int]]] = [
             [{} for _ in range(JGSLayoutBlock.col_num)]
             for _ in range(JGSLayoutBlock.row_num)
         ]
+        # 按军旗位置分组: 旗在左大本营(col=1) / 旗在右大本营(col=3)
+        self._counts_flag_left = self._empty_counts()
+        self._counts_flag_right = self._empty_counts()
         self._layout_count = 0  # 统计的布阵总数（受筛选影响, 每个文件 1~4 个）
         self._file_count = 0    # 成功解析的文件数
         self._failed_files: list[tuple[str, str]] = []  # (文件, 失败原因)
         self._skipped_1v1_files: list[str] = []  # 1v1(单挑)复盘, 不计入统计
         self._skipped_abnormal_files: list[tuple[str, str]] = []  # 联众异常复盘
 
+    @staticmethod
+    def _empty_counts():
+        return [[{} for _ in range(JGSLayoutBlock.col_num)]
+                for _ in range(JGSLayoutBlock.row_num)]
+
     @property
     def skipped_abnormal_files(self) -> list[tuple[str, str]]:
         return list(self._skipped_abnormal_files)
 
     def add_layout(self, layout: JGSLayoutBlock) -> None:
+        flag_side = self._detect_flag_side_layout(layout)
+        target = self._counts_flag_left if flag_side == "left" else self._counts_flag_right
         for row in range(JGSLayoutBlock.row_num):
             for col in range(JGSLayoutBlock.col_num):
                 item_type = layout.item(row, col)
                 counter = self._counts[row][col]
                 counter[item_type] = counter.get(item_type, 0) + 1
+                tc = target[row][col]
+                tc[item_type] = tc.get(item_type, 0) + 1
         self._layout_count += 1
+
+    @staticmethod
+    def _detect_flag_side_layout(layout: JGSLayoutBlock) -> str:
+        """检测QQ布阵军旗位置: col=1 -> 'left', col=3 -> 'right'"""
+        for row in range(JGSLayoutBlock.row_num):
+            for col in range(JGSLayoutBlock.col_num):
+                if layout.item(row, col) == ItemType.Junqi:
+                    return "left" if col <= 2 else "right"
+        return "left"  # 默认归左
+
+    @staticmethod
+    def _detect_flag_side_matrix(board: list[list[str]]) -> str:
+        """检测联众布阵军旗位置: col=1 -> 'left', col=3 -> 'right'"""
+        for row in range(len(board)):
+            for col in range(len(board[row])):
+                if board[row][col] == "旗":
+                    return "left" if col <= 2 else "right"
+        return "left"
 
     def add_matrix(self, board: list[list[str]], char_to_itemtype: dict) -> None:
         """联众布阵专用: 接受 6x5 字符矩阵, 用映射表转为 ItemType 后统计"""
+        flag_side = self._detect_flag_side_matrix(board)
+        target = self._counts_flag_left if flag_side == "left" else self._counts_flag_right
         for row in range(JGSLayoutBlock.row_num):
             for col in range(JGSLayoutBlock.col_num):
                 ch = board[row][col] if row < len(board) and col < len(board[row]) else "空"
                 item_type = char_to_itemtype.get(ch, ItemType.JQNone)
                 counter = self._counts[row][col]
                 counter[item_type] = counter.get(item_type, 0) + 1
+                tc = target[row][col]
+                tc[item_type] = tc.get(item_type, 0) + 1
         self._layout_count += 1
 
     def add_jqh_folder(self, folder: str | os.PathLike, colors: set[str],
@@ -292,25 +326,97 @@ class LayoutStats:
         }
 
     def _cell_text(self, row: int, col: int, top_n: int = 5) -> str:
-        """单个位置的单元格文本: top_n 频率 + 其它汇总, 格式 '司令： 35.2%( 12/340)'
-
-        百分比固定宽度对齐; 分子/分母按分母位数对齐。行营位置不展示, 返回空字符串"""
+        """单个位置的单元格文本: top_n 频率 + 其它汇总, 格式 '司令： 35.2%(12次)'"""
         if (row, col) in CAMP_POSITIONS:
             return ""
         stats = self.position_stat(row, col)
         if not stats:
             return "(无样本)"
-        total = sum(c for _, c, _ in stats)
-        w = len(str(total))  # 分子/分母宽度以分母位数为准
         lines = [
-            f"{item_type2string(t)}：{ratio * 100:5.1f}%({c:{w}d}/{total:{w}d})"
+            f"{item_type2string(t)}：{ratio * 100:5.1f}%({c}次)"
             for t, c, ratio in stats[:top_n]
         ]
         rest = stats[top_n:]
         if rest:
             rest_count = sum(c for _, c, _ in rest)
-            lines.append(
-                f"其它：{rest_count / total * 100:5.1f}%({rest_count:{w}d}/{total:{w}d})")
+            rest_ratio = rest_count / sum(c for _, c, _ in stats)
+            lines.append(f"其它：{rest_ratio * 100:5.1f}%({rest_count}次)")
+        return "\n".join(lines)
+
+    def _cell_text_filtered(self, row: int, col: int, piece_filter: set[ItemType]) -> str:
+        """棋子维度统计: 只展示 piece_filter 中棋子在该位置的频率"""
+        if (row, col) in CAMP_POSITIONS:
+            return ""
+        counter = self._counts[row][col]
+        total = sum(counter.values())
+        if total == 0:
+            return "(无样本)"
+        filtered = [(t, c) for t, c in counter.items() if t in piece_filter]
+        if not filtered:
+            return "(无命中)"
+        filtered.sort(key=lambda x: (-x[1], x[0]))
+        lines = [
+            f"{item_type2string(t)}：{c / total * 100:5.1f}%({c}次)"
+            for t, c in filtered
+        ]
+        return "\n".join(lines)
+
+    def _cell_text_filtered_mainline(self, row: int, col: int, piece_filter: set[ItemType]) -> str:
+        """棋子维度统计(主线模式): 左旗 + 镜像右旗, 只展示选中棋子"""
+        if (row, col) in CAMP_POSITIONS:
+            return ""
+        merged = self._merge_counts_mainline(row, col)
+        total = sum(merged.values())
+        if total == 0:
+            return "(无样本)"
+        filtered = [(t, c) for t, c in merged.items() if t in piece_filter]
+        if not filtered:
+            return "(无命中)"
+        filtered.sort(key=lambda x: (-x[1], x[0]))
+        lines = [
+            f"{item_type2string(t)}：{c / total * 100:5.1f}%({c}次)"
+            for t, c in filtered
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _mirror_col(col: int) -> int:
+        """镜像列索引: col <-> 4-col"""
+        return JGSLayoutBlock.col_num - 1 - col
+
+    def _merge_counts_mainline(self, row: int, col: int) -> dict[ItemType, int]:
+        """主线(旗侧)模式: 左旗统计 + 镜像后的右旗统计"""
+        merged: dict[ItemType, int] = {}
+        # 左旗布局: 直接取 (row, col)
+        for t, c in self._counts_flag_left[row][col].items():
+            merged[t] = merged.get(t, 0) + c
+        # 右旗布局: 取镜像位置 (row, 4-col)
+        mirror_col = self._mirror_col(col)
+        for t, c in self._counts_flag_right[row][mirror_col].items():
+            merged[t] = merged.get(t, 0) + c
+        return merged
+
+    def _cell_text_mainline(self, row: int, col: int, top_n: int = 5) -> str:
+        """主线(旗侧)模式的单元格文本: 左旗 + 镜像右旗"""
+        if (row, col) in CAMP_POSITIONS:
+            return ""
+        merged = self._merge_counts_mainline(row, col)
+        total = sum(merged.values())
+        if total == 0:
+            return "(无样本)"
+        stats = sorted(
+            ((t, c, c / total) for t, c in merged.items()),
+            key=lambda x: (-x[1], x[0]),
+        )
+        lines = [
+            f"{item_type2string(t)}：{ratio * 100:5.1f}%({c}次)"
+            for t, c, ratio in stats[:top_n]
+        ]
+        rest = stats[top_n:]
+        if rest:
+            rest_count = sum(c for _, c, _ in rest)
+            rest_ratio = rest_count / total
+            lines.append(f"其它：{rest_ratio * 100:5.1f}%({rest_count}次)")
         return "\n".join(lines)
 
     def save_excel(self, xlsx_file: str | os.PathLike, top_n: int = 5,
@@ -375,6 +481,70 @@ class LayoutStats:
                       f"跳过1v1 {len(self._skipped_1v1_files)})")
         ws.cell(row=info_row + 1, column=1,
                 value=f"统计布阵数: {self._layout_count}")
+
+        wb.save(str(xlsx_file))
+
+    def save_excel_filtered(self, xlsx_file: str | os.PathLike,
+                           piece_filter: set[ItemType],
+                           mirror_cols: bool = False) -> None:
+        """导出棋子维度统计 Excel: 只展示被选中棋子的频率
+
+        mirror_cols=True 时(顺时针行棋习惯), 以中间列为轴镜像翻转列顺序展示"""
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "棋子维度统计"
+
+        header_font = Font(bold=True)
+        header_fill = PatternFill("solid", fgColor="D9E1F2")
+        center = Alignment(horizontal="center", vertical="center")
+        cell_align = Alignment(wrap_text=True, horizontal="left", vertical="top")
+        thin = Side(style="thin")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        corner = ws.cell(row=1, column=1, value="位置")
+        corner.font = header_font
+        corner.fill = header_fill
+        corner.alignment = center
+        corner.border = border
+        for col in range(JGSLayoutBlock.col_num):
+            c = ws.cell(row=1, column=col + 2, value=f"第{col + 1}列")
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+            c.border = border
+        row_titles = ["第1行", "第2行", "第3行", "第4行", "第5行", "第6行"]
+        for row in range(JGSLayoutBlock.row_num):
+            c = ws.cell(row=row + 2, column=1, value=row_titles[row])
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+            c.border = border
+
+        for row in range(JGSLayoutBlock.row_num):
+            for col in range(JGSLayoutBlock.col_num):
+                data_col = JGSLayoutBlock.col_num - 1 - col if mirror_cols else col
+                c = ws.cell(row=row + 2, column=col + 2,
+                            value=self._cell_text_filtered(row, data_col, piece_filter))
+                c.alignment = cell_align
+                c.border = border
+
+        ws.column_dimensions["A"].width = 16
+        for col in range(JGSLayoutBlock.col_num):
+            ws.column_dimensions[chr(ord("B") + col)].width = 26
+        for row in range(JGSLayoutBlock.row_num):
+            ws.row_dimensions[row + 2].height = 15 * (len(piece_filter) + 1) + 6
+
+        info_row = JGSLayoutBlock.row_num + 3
+        ws.cell(row=info_row, column=1,
+                value=f"统计文件数: {self._file_count} (失败 {len(self._failed_files)}, "
+                      f"跳过1v1 {len(self._skipped_1v1_files)})")
+        ws.cell(row=info_row + 1, column=1,
+                value=f"统计布阵数: {self._layout_count}")
+        ws.cell(row=info_row + 2, column=1,
+                value=f"筛选棋子: {', '.join(item_type2string(t) for t in sorted(piece_filter, key=lambda x: int(x)))}")
 
         wb.save(str(xlsx_file))
 
