@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['E:\\Program Files\\JunqiReplayDIY\\JQ_Replay_Stat\\stats_gui.py'],
+    ['E:\\Program Files\\JQ_Replay_Stat\\stats_gui.py'],
     pathex=[],
     binaries=[],
     datas=[],

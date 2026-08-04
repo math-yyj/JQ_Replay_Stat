@@ -9,6 +9,23 @@ from .block import TOTAL_INFO_BLOCK_SIZE, JGSLayoutBlock, JGSTotalInfoBlock
 from .jgs_types import GameException, ItemColor, ItemType, item_type2string
 
 
+import math
+
+
+def _fmt_pct(ratio: float) -> str:
+    """格式化百分比, 100% 显示为 ' 100%'(5字符宽), 其它 %5.1f"""
+    val = ratio * 100
+    if val == 100:
+        return " 100%"
+    return f"{val:5.1f}%"
+
+
+def _fmt_count(c: int, total: int) -> str:
+    """格式化数量, 宽度 = 1 + int(log10(total))"""
+    w = 1 + int(math.log10(total)) if total > 0 else 1
+    return f"{c:{w}d}"
+
+
 def find_jgs_files(folder: str | os.PathLike) -> list[str]:
     """用 glob.glob 递归遍历指定文件夹，查找所有 .jgs 文件"""
     pattern = os.path.join(str(folder), "**", "*.jgs")
@@ -117,7 +134,9 @@ class LayoutStats:
     row 0 为最前排（靠近对方），row 5 为最后排（大本营所在排）。
     """
 
-    def __init__(self):
+    def __init__(self, dedup: bool = False):
+        self._dedup = dedup
+        self._seen_layouts: set[tuple] = set()  # 用于去重的已见布阵集合
         # _counts[row][col][ItemType] = 出现次数 (左右旗合并, 等于 left+right)
         self._counts: list[list[dict[ItemType, int]]] = [
             [{} for _ in range(JGSLayoutBlock.col_num)]
@@ -132,6 +151,17 @@ class LayoutStats:
         self._skipped_1v1_files: list[str] = []  # 1v1(单挑)复盘, 不计入统计
         self._skipped_abnormal_files: list[tuple[str, str]] = []  # 联众异常复盘
 
+    def _layout_to_key(self, layout: JGSLayoutBlock) -> tuple:
+        """将布阵转换为可哈希的元组, 用于去重"""
+        return tuple(
+            tuple(layout.item(row, col) for col in range(JGSLayoutBlock.col_num))
+            for row in range(JGSLayoutBlock.row_num)
+        )
+
+    def _matrix_to_key(self, board: list[list[str]]) -> tuple:
+        """将联众布阵矩阵转换为可哈希的元组, 用于去重"""
+        return tuple(tuple(row) for row in board)
+
     @staticmethod
     def _empty_counts():
         return [[{} for _ in range(JGSLayoutBlock.col_num)]
@@ -142,6 +172,13 @@ class LayoutStats:
         return list(self._skipped_abnormal_files)
 
     def add_layout(self, layout: JGSLayoutBlock) -> None:
+        # 去重检查
+        if self._dedup:
+            key = self._layout_to_key(layout)
+            if key in self._seen_layouts:
+                return
+            self._seen_layouts.add(key)
+
         flag_side = self._detect_flag_side_layout(layout)
         target = self._counts_flag_left if flag_side == "left" else self._counts_flag_right
         for row in range(JGSLayoutBlock.row_num):
@@ -173,6 +210,13 @@ class LayoutStats:
 
     def add_matrix(self, board: list[list[str]], char_to_itemtype: dict) -> None:
         """联众布阵专用: 接受 6x5 字符矩阵, 用映射表转为 ItemType 后统计"""
+        # 去重检查
+        if self._dedup:
+            key = self._matrix_to_key(board)
+            if key in self._seen_layouts:
+                return
+            self._seen_layouts.add(key)
+
         flag_side = self._detect_flag_side_matrix(board)
         target = self._counts_flag_left if flag_side == "left" else self._counts_flag_right
         for row in range(JGSLayoutBlock.row_num):
@@ -368,23 +412,80 @@ class LayoutStats:
             "positions": positions,
         }
 
-    def _cell_text(self, row: int, col: int, top_n: int = 5) -> str:
-        """单个位置的单元格文本: top_n 频率 + 其它汇总, 格式 '司令： 35.2%(12次)'"""
+    # 棋子显示顺序 (2个一行)
+    PIECE_DISPLAY_ORDER = [
+        (ItemType.Silin, ItemType.Junzhang),      # 司, 军
+        (ItemType.Shizhang, ItemType.Lvzhang),    # 师, 旅
+        (ItemType.Tuanzhang, ItemType.Yinzhang),  # 团, 营
+        (ItemType.Lianzhang, ItemType.Paizhang),  # 连, 排
+        (ItemType.Gongbing, ItemType.Zhadan),     # 兵, 弹
+        (ItemType.Dilei, ItemType.Junqi),         # 雷, 旗
+    ]
+
+    def _should_show_piece(self, piece: ItemType, row: int, col: int) -> bool:
+        """根据位置判断某棋子是否应该显示"""
+        if piece == ItemType.Zhadan and row == 0:
+            return False  # 弹不在第0行
+        if piece == ItemType.Dilei and row not in (4, 5):
+            return False  # 雷只在最后两行
+        if piece == ItemType.Junqi and (row, col) not in ((5, 1), (5, 3)):
+            return False  # 旗只在大本营
+        return True
+
+    def _cell_text_with_ranks(self, row: int, col: int, show_pct: bool = True):
+        """返回单元格文本及逐段排名信息, 用于着色
+
+        返回 [(行文本, [(片段, 排名), ...]), ...], 排名从1开始
+        show_pct=True 显示百分比, False 显示数量
+        """
         if (row, col) in CAMP_POSITIONS:
-            return ""
-        stats = self.position_stat(row, col)
-        if not stats:
-            return "(无样本)"
-        lines = [
-            f"{item_type2string(t)}：{ratio * 100:5.1f}%({c}次)"
-            for t, c, ratio in stats[:top_n]
-        ]
-        rest = stats[top_n:]
-        if rest:
-            rest_count = sum(c for _, c, _ in rest)
-            rest_ratio = rest_count / sum(c for _, c, _ in stats)
-            lines.append(f"其它：{rest_ratio * 100:5.1f}%({rest_count}次)")
-        return "\n".join(lines)
+            return []
+        counter = self._counts[row][col]
+        total = sum(counter.values())
+        if total == 0:
+            return [("(无样本)", [("(无样本)", 0)])]
+
+        # 计算所有合法棋子的频率并按百分比降序排列
+        pieces = []
+        for p in counter:
+            if p == ItemType.JQNone:
+                continue
+            if not self._should_show_piece(p, row, col):
+                continue
+            c = counter[p]
+            ratio = c / total if total > 0 else 0
+            pieces.append((p, c, ratio))
+        pieces.sort(key=lambda x: (-x[2], x[0]))  # 按百分比降序
+
+        # 每行显示2个棋子, 每个棋子独立排名着色
+        lines = []
+        for i in range(0, len(pieces), 2):
+            segs = []  # [(片段文本, 排名), ...]
+            for j in range(2):
+                if i + j < len(pieces):
+                    p, c, ratio = pieces[i + j]
+                    rank = i + j + 1
+                    val = _fmt_pct(ratio) if show_pct else _fmt_count(c, total)
+                    segs.append((f"{item_type2string(p)}:{val}", rank))
+            if segs:
+                line_text = "  ".join(s[0] for s in segs)
+                lines.append((line_text, segs))
+        return lines if lines else [("(无样本)", [("(无样本)", 0)])]
+
+    def _cell_text(self, row: int, col: int, top_n: int = 5) -> str:
+        """单个位置的单元格文本（纯文本版本，用于导出等场景）"""
+        lines = self._cell_text_with_ranks(row, col)
+        return "\n".join(text for text, _ in lines)
+
+    def _cell_text_plain(self, row: int, col: int) -> str:
+        """纯文本版本，忽略排名信息"""
+        lines = self._cell_text_with_ranks(row, col)
+        return "\n".join(text for text, _ in lines)
+
+    def _cell_text_simple(self, row: int, col: int) -> str:
+        """简单文本版本，用于兼容旧接口"""
+        lines = self._cell_text_with_ranks(row, col)
+        return "\n".join(text for text, _ in lines)
 
     def _cell_text_filtered(self, row: int, col: int, piece_filter: set[ItemType]) -> str:
         """棋子维度统计: 只展示 piece_filter 中棋子在该位置的频率"""
@@ -399,7 +500,7 @@ class LayoutStats:
             return "(无命中)"
         filtered.sort(key=lambda x: (-x[1], x[0]))
         lines = [
-            f"{item_type2string(t)}：{c / total * 100:5.1f}%({c}次)"
+            f"{item_type2string(t)}:{_fmt_pct(c / total)}({c})"
             for t, c in filtered
         ]
         return "\n".join(lines)
@@ -417,7 +518,7 @@ class LayoutStats:
             return "(无命中)"
         filtered.sort(key=lambda x: (-x[1], x[0]))
         lines = [
-            f"{item_type2string(t)}：{c / total * 100:5.1f}%({c}次)"
+            f"{item_type2string(t)}:{_fmt_pct(c / total)}({c})"
             for t, c in filtered
         ]
         return "\n".join(lines)
@@ -440,27 +541,45 @@ class LayoutStats:
         return merged
 
     def _cell_text_mainline(self, row: int, col: int, top_n: int = 5) -> str:
-        """主线(旗侧)模式的单元格文本: 左旗 + 镜像右旗"""
+        """主线(旗侧)模式的单元格文本（纯文本版本）"""
+        lines = self._cell_text_mainline_with_ranks(row, col)
+        return "\n".join(text for text, _ in lines)
+
+    def _cell_text_mainline_with_ranks(self, row: int, col: int, show_pct: bool = True):
+        """主线(旗侧)模式的单元格文本及逐段排名信息, 按百分比降序排列"""
         if (row, col) in CAMP_POSITIONS:
-            return ""
+            return []
         merged = self._merge_counts_mainline(row, col)
         total = sum(merged.values())
         if total == 0:
-            return "(无样本)"
-        stats = sorted(
-            ((t, c, c / total) for t, c in merged.items()),
-            key=lambda x: (-x[1], x[0]),
-        )
-        lines = [
-            f"{item_type2string(t)}：{ratio * 100:5.1f}%({c}次)"
-            for t, c, ratio in stats[:top_n]
-        ]
-        rest = stats[top_n:]
-        if rest:
-            rest_count = sum(c for _, c, _ in rest)
-            rest_ratio = rest_count / total
-            lines.append(f"其它：{rest_ratio * 100:5.1f}%({rest_count}次)")
-        return "\n".join(lines)
+            return [("(无样本)", [("(无样本)", 0)])]
+
+        # 计算所有合法棋子的频率并按百分比降序排列
+        pieces = []
+        for p in merged:
+            if p == ItemType.JQNone:
+                continue
+            if not self._should_show_piece(p, row, col):
+                continue
+            c = merged[p]
+            ratio = c / total if total > 0 else 0
+            pieces.append((p, c, ratio))
+        pieces.sort(key=lambda x: (-x[2], x[0]))  # 按百分比降序
+
+        # 每行显示2个棋子, 每个棋子独立排名着色
+        lines = []
+        for i in range(0, len(pieces), 2):
+            segs = []  # [(片段文本, 排名), ...]
+            for j in range(2):
+                if i + j < len(pieces):
+                    p, c, ratio = pieces[i + j]
+                    rank = i + j + 1
+                    val = _fmt_pct(ratio) if show_pct else _fmt_count(c, total)
+                    segs.append((f"{item_type2string(p)}:{val}", rank))
+            if segs:
+                line_text = "  ".join(s[0] for s in segs)
+                lines.append((line_text, segs))
+        return lines if lines else [("(无样本)", [("(无样本)", 0)])]
 
     def save_excel(self, xlsx_file: str | os.PathLike, top_n: int = 5,
                    mirror_cols: bool = False) -> None:
