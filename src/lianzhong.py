@@ -78,6 +78,83 @@ def get_char_to_itemtype():
     }
 
 
+# ============================================================
+# 联众 .JQH 用户名解码
+# ============================================================
+# 编码方案: encoded[i] = ((encoded[i-1] + plaintext[i]) % 0x100) ^ 0x13
+#   - 第一个字节不加密, 直接是明文
+#   - 后续字节依赖前一个 encoded 字节
+#   - 用户名最长20字节, 不足时用 0x00 填充
+
+JQH_USERNAME_OFFSET = 0x64   # 四家用户名起始偏移
+JQH_USERNAME_LEN = 20        # 每家用户名最大长度
+JQH_USERNAME_COUNT = 4       # 四家
+JQH_USERNAME_XOR_KEY = 0x13  # XOR密钥
+
+
+def decode_jqh_username(raw: bytes) -> str:
+    """解码单个联众用户名 (20字节编码数据 -> 字符串)
+
+    编码公式: encoded[i] = ((encoded[i-1] + plaintext[i]) % 0x100) ^ 0x13
+    解码公式: plaintext[i] = ((encoded[i] ^ 0x13) - encoded[i-1]) % 0x100
+    第一个字节不加密, 直接是明文。
+    """
+    if len(raw) < JQH_USERNAME_LEN:
+        return ""
+    decoded = bytearray(JQH_USERNAME_LEN)
+    prev_encoded = 0
+    for i in range(JQH_USERNAME_LEN):
+        encoded_byte = raw[i]
+        if i == 0:
+            decoded[i] = encoded_byte  # 第一个字节不加密
+        else:
+            decoded[i] = ((encoded_byte ^ JQH_USERNAME_XOR_KEY) - prev_encoded) % 0x100
+        prev_encoded = encoded_byte
+    # 截断到第一个 \x00
+    null_pos = decoded.find(0)
+    if null_pos >= 0:
+        decoded = decoded[:null_pos]
+    try:
+        return decoded.decode("gbk")
+    except UnicodeDecodeError:
+        return decoded.decode("utf-8", errors="replace")
+
+
+def decode_jqh_all_usernames(raw: bytes) -> list[str]:
+    """解码联众复盘文件中四家用户名 [红, 绿, 蓝, 黑]
+
+    注意: 整个80字节是连续编码链，每20字节为一家。
+    仅红方首字母不加密，后续所有字节(含绿蓝黑首字母)都根据前一个编码字节加密。
+    """
+    block = raw[JQH_USERNAME_OFFSET:JQH_USERNAME_OFFSET + JQH_USERNAME_COUNT * JQH_USERNAME_LEN]
+    if len(block) < JQH_USERNAME_COUNT * JQH_USERNAME_LEN:
+        return [""] * JQH_USERNAME_COUNT
+
+    decoded_all = bytearray(JQH_USERNAME_COUNT * JQH_USERNAME_LEN)
+    prev_encoded = 0
+    for i in range(JQH_USERNAME_COUNT * JQH_USERNAME_LEN):
+        encoded_byte = block[i]
+        if i == 0:
+            decoded_all[i] = encoded_byte
+        else:
+            decoded_all[i] = ((encoded_byte ^ JQH_USERNAME_XOR_KEY) - prev_encoded) % 0x100
+        prev_encoded = encoded_byte
+
+    # 按20字节分割为四家
+    names = []
+    for player_idx in range(JQH_USERNAME_COUNT):
+        start = player_idx * JQH_USERNAME_LEN
+        chunk = decoded_all[start:start + JQH_USERNAME_LEN]
+        null_pos = chunk.find(0)
+        if null_pos >= 0:
+            chunk = chunk[:null_pos]
+        try:
+            names.append(chunk.decode("gbk"))
+        except UnicodeDecodeError:
+            names.append(chunk.decode("utf-8", errors="replace"))
+    return names
+
+
 def parse_jqs_layout(data: bytes, offset: int = JQS_LAYOUT_OFFSET) -> list[list[str]]:
     """解析联众 .jqs 单家布阵, 返回 6x5 的棋子字符矩阵(行主序, '空'=行营)。
 

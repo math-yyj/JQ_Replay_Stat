@@ -616,7 +616,7 @@ class LianzhongPanel(StatPanel):
             messagebox.showwarning("提示", "请至少勾选一个颜色")
             return None
         desc = "颜色[" + "+".join(chosen) + "]"
-        return None, None, desc  # selector/predicate 不用, desc 用于显示
+        return None, None, desc
 
     def _start_stat(self) -> None:
         """联众模式重写: 用 add_jqh_folder 替代 add_folder"""
@@ -655,6 +655,261 @@ class LianzhongPanel(StatPanel):
         self._worker = threading.Thread(target=worker, daemon=True)
         self._worker.start()
         self.after(100, self._poll_worker)
+
+
+class LianzhongFirstPanel(LianzhongPanel):
+    """联众先手方视角统计: 按座次(先手位/二号位/三号位/四号位)统计布阵频率
+
+    逻辑与 LianzhongPanel 完全一致，仅颜色名称和按钮状态不同。"""
+
+    COLORS = ["先手位", "二号位", "三号位", "四号位"]
+
+    def _build_filter(self, bar: ttk.Frame) -> None:
+        ttk.Label(bar, text="座次(并集):").pack(side=tk.LEFT)
+        self.color_vars: dict[str, tk.BooleanVar] = {}
+        for name in self.COLORS:
+            var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(bar, text=name, variable=var).pack(side=tk.LEFT, padx=(4, 0))
+            self.color_vars[name] = var
+        ttk.Label(bar, text="  ").pack(side=tk.LEFT)
+
+    def _build_toolbar(self) -> None:
+        """重写工具栏: 开始统计按钮暂时禁用"""
+        super()._build_toolbar()
+        self.run_btn.config(state=tk.DISABLED)
+
+
+class LianzhongIDPanel(StatPanel):
+    """联众ID统计: 按用户名黑白名单筛选联众布阵, 支持导出筛选结果"""
+
+    def __init__(self, parent, folder_var, export_name, mirror_getter=None,
+                 mainline_getter=None, dedup_getter=None, display_mode_getter=None):
+        self.matched_layouts = []
+        super().__init__(parent, folder_var, export_name, mirror_getter, mainline_getter, dedup_getter, display_mode_getter)
+
+    def _build_toolbar(self) -> None:
+        bar = ttk.Frame(self)
+        bar.pack(fill=tk.X, pady=(0, 4))
+        self._build_filter(bar)
+        self.run_btn = ttk.Button(bar, text="开始统计", command=self._start_stat)
+        self.run_btn.pack(side=tk.LEFT)
+        self.export_btn = ttk.Button(bar, text="导出布阵", command=self._export_layouts, state=tk.DISABLED)
+        self.export_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.export_format_var = tk.StringVar(value="联众(jqs)")
+        for fmt in ("联众(jqs)", "QQ(jql)"):
+            ttk.Radiobutton(bar, text=fmt, value=fmt,
+                            variable=self.export_format_var).pack(side=tk.LEFT, padx=(4, 0))
+
+    def _build_filter(self, bar: ttk.Frame) -> None:
+        ttk.Label(bar, text="白名单:").pack(side=tk.LEFT)
+        self.whitelist_var = tk.StringVar()
+        ttk.Entry(bar, textvariable=self.whitelist_var, width=20).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(bar, text="黑名单:").pack(side=tk.LEFT)
+        self.blacklist_var = tk.StringVar()
+        ttk.Entry(bar, textvariable=self.blacklist_var, width=20).pack(side=tk.LEFT, padx=(4, 8))
+
+    def _parse_id_list(self, text: str) -> set[str]:
+        return {item.strip() for item in text.split(",") if item.strip()}
+
+    def _get_filter(self):
+        whitelist = self._parse_id_list(self.whitelist_var.get())
+        blacklist = self._parse_id_list(self.blacklist_var.get())
+        if not whitelist and not blacklist:
+            messagebox.showwarning("提示", "请至少填写白名单或黑名单中的一个ID")
+            return None
+        wl = whitelist
+        bl = blacklist
+        def predicate(layout_info_block, self_color):
+            # 联众模式下, 通过 player_name 判断
+            return True  # 实际过滤在 _start_stat 中完成
+        parts = []
+        if wl:
+            parts.append(f"白名单[{','.join(sorted(wl))}]")
+        if bl:
+            parts.append(f"黑名单[{','.join(sorted(bl))}]")
+        desc = "+".join(parts)
+        return None, predicate, desc
+
+    def _start_stat(self) -> None:
+        folder = self._folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning("提示", "请先选择有效的文件夹")
+            return
+
+        flt = self._get_filter()
+        if flt is None:
+            return
+        _, _, self._filter_desc = flt
+
+        whitelist = self._parse_id_list(self.whitelist_var.get())
+        blacklist = self._parse_id_list(self.blacklist_var.get())
+
+        self.run_btn.config(state=tk.DISABLED)
+        self.export_btn.config(state=tk.DISABLED)
+        self.summary_var.set("统计中……")
+
+        dedup = self._dedup_getter()
+
+        def progress_callback(done, total):
+            self.summary_var.set(f"统计中…… {done}/{total}")
+
+        def worker():
+            stats = LayoutStats(dedup=dedup)
+            matched = []
+            try:
+                from src.lianzhong import decode_jqh_all_boards, decode_jqh_all_usernames, get_char_to_itemtype
+                c2i = get_char_to_itemtype()
+                ALL_COLORS = ["红", "绿", "蓝", "黑"]
+                pattern = os.path.join(folder, "**", "*.jqh")
+                files = sorted(glob.glob(pattern, recursive=True))
+                total = len(files)
+                for i, jqh_file in enumerate(files):
+                    try:
+                        raw = open(jqh_file, "rb").read()
+                        boards, _ = decode_jqh_all_boards(raw)
+                        usernames = decode_jqh_all_usernames(raw)
+                        for color_idx, color in enumerate(ALL_COLORS):
+                            board = boards.get(color)
+                            if board is None:
+                                continue
+                            if all(ch == "空" for row in board for ch in row):
+                                continue
+                            username = usernames[color_idx] if color_idx < len(usernames) else ""
+                            if whitelist and username not in whitelist:
+                                continue
+                            if blacklist and username in blacklist:
+                                continue
+                            stats.add_matrix(board, c2i)
+                            matched.append((jqh_file, color, board))
+                        stats._file_count += 1
+                    except Exception as e:
+                        stats._failed_files.append((jqh_file, str(e)))
+                    if progress_callback:
+                        progress_callback(i + 1, total)
+                self._result = (stats, len(files), None, matched)
+            except Exception as e:
+                self._result = (None, 0, str(e), [])
+
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
+        self.after(100, self._poll_worker)
+
+    def _poll_worker(self) -> None:
+        if self._worker.is_alive():
+            self.after(100, self._poll_worker)
+            return
+        stats, total_files, err, matched = self._result
+        self.run_btn.config(state=tk.NORMAL)
+        if err is not None:
+            self.summary_var.set(f"统计失败: {err}")
+            messagebox.showerror("错误", err)
+            return
+        if total_files == 0:
+            self.summary_var.set("未找到 .jqh 文件")
+            messagebox.showinfo("提示", "该文件夹下未找到 .jqh 文件")
+            return
+        self.stats = stats
+        self.matched_layouts = matched
+        self._refresh_grid()
+        failed = len(stats.failed_files)
+        summary = (f"筛选: {self._filter_desc}    找到文件: {total_files}    "
+                   f"解析成功: {stats.file_count}    失败: {failed}    "
+                   f"统计布阵数: {stats.layout_count}")
+        self.summary_var.set(summary)
+        self.export_btn.config(state=tk.NORMAL if matched else tk.DISABLED)
+        if failed:
+            paths = [str(Path(f).name) for f, _ in stats.failed_files[:10]]
+            detail = "\n".join(paths)
+            if failed > 10:
+                detail += f"\n……共 {failed} 个"
+            messagebox.showwarning("部分文件解析失败", detail)
+
+    def _export_layouts(self) -> None:
+        """导出筛选后的布阵文件"""
+        if not self.matched_layouts:
+            messagebox.showwarning("提示", "没有可导出的布阵")
+            return
+        save_dir = filedialog.askdirectory(title="选择导出目录", parent=self.winfo_toplevel())
+        if not save_dir:
+            return
+        try:
+            total_count = len(self.matched_layouts)
+            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
+            is_jqs = self.export_format_var.get() == "联众(jqs)"
+            JQS_HEADER = bytes([
+                0x47, 0x4C, 0xE9, 0x03, 0xCE, 0x07, 0xC4, 0x02, 0x53, 0x61, 0x74, 0x20,
+                0x41, 0x75, 0x67, 0x20, 0x30, 0x31, 0x20, 0x32, 0x32, 0x3A, 0x34, 0x35,
+                0x3A, 0x30, 0x33, 0x20, 0x32, 0x30, 0x32, 0x36, 0x0A, 0x00, 0x00, 0x00,
+                0x62, 0x79, 0x20, 0x5B, 0xD1, 0xD0, 0xBE, 0xBF, 0x31, 0x5D, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00
+            ])
+            JQS_LAYOUT_OFFSET = 0x370
+            JQS_ROW_STRIDE = 17
+            JQS_FILE_SIZE = 1264
+            PIECE_TO_JQS = {
+                ItemType.JQNone: 0x00, ItemType.Junzhang: 0x01, ItemType.Shizhang: 0x02,
+                ItemType.Lvzhang: 0x03, ItemType.Tuanzhang: 0x04, ItemType.Yinzhang: 0x05,
+                ItemType.Lianzhang: 0x06, ItemType.Paizhang: 0x07, ItemType.Gongbing: 0x08,
+                ItemType.Junqi: 0x09, ItemType.Silin: 0x0A, ItemType.Dilei: 0x0B,
+                ItemType.Zhadan: 0x0C,
+            }
+            JQL_HEADER = bytes([0x51, 0x51, 0x47, 0x61, 0x6D, 0x65, 0x20, 0x4A,
+                                0x51, 0x4C, 0x20, 0x46, 0x69, 0x6C, 0x65, 0x00,
+                                0x57, 0x04, 0x00, 0x00])
+            JQL_LAYOUT_OFFSET = 0x14
+            JQL_FILE_SIZE = 50
+            PIECE_TO_JQL = {
+                ItemType.JQNone: 0x00, ItemType.Junzhang: 0x01, ItemType.Shizhang: 0x02,
+                ItemType.Lvzhang: 0x03, ItemType.Tuanzhang: 0x04, ItemType.Yinzhang: 0x05,
+                ItemType.Lianzhang: 0x06, ItemType.Paizhang: 0x07, ItemType.Gongbing: 0x08,
+                ItemType.Junqi: 0x09, ItemType.Silin: 0x0A, ItemType.Dilei: 0x0B,
+                ItemType.Zhadan: 0x0C,
+            }
+            PIECE_TO_EXPORT = PIECE_TO_JQS if is_jqs else PIECE_TO_JQL
+            exported_count = 0
+            for i, (file_path, color, layout_data) in enumerate(self.matched_layouts):
+                original_name = Path(file_path).stem
+                ext = ".jqs" if is_jqs else ".jql"
+                new_filename = f"{i:0{prefix_digits}d}_{original_name}{ext}"
+                output_path = os.path.join(save_dir, new_filename)
+                def get_piece_type(row, col):
+                    if isinstance(layout_data, JGSLayoutBlock):
+                        return layout_data.item(row, col)
+                    else:
+                        from src.lianzhong import get_char_to_itemtype
+                        c2i = get_char_to_itemtype()
+                        return c2i.get(layout_data[row][col], ItemType.JQNone)
+                if is_jqs:
+                    data = bytearray(JQS_FILE_SIZE)
+                    data[0:len(JQS_HEADER)] = JQS_HEADER
+                    for row in range(6):
+                        for col in range(5):
+                            offset = JQS_LAYOUT_OFFSET + (row * JQS_ROW_STRIDE + col) * 4
+                            pt = get_piece_type(row, col)
+                            code = 0x00 if (row, col) in CAMP_POSITIONS else PIECE_TO_EXPORT.get(pt, 0x00)
+                            struct.pack_into('<I', data, offset, code)
+                else:
+                    data = bytearray(JQL_FILE_SIZE)
+                    data[0:20] = JQL_HEADER
+                    for row in range(6):
+                        for col in range(5):
+                            offset = JQL_LAYOUT_OFFSET + row * 5 + col
+                            pt = get_piece_type(row, col)
+                            data[offset] = int(pt)
+                with open(output_path, 'wb') as f:
+                    f.write(data)
+                exported_count += 1
+                self.summary_var.set(f"导出中…… {exported_count}/{total_count}")
+            messagebox.showinfo("完成", f"成功导出 {exported_count} 个布局文件到:\n{save_dir}")
+            self.summary_var.set(f"已导出 {exported_count} 个布局文件")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+            self.summary_var.set(f"导出失败: {e}")
 
 
 class PieceFilterPanel(StatPanel):
@@ -792,30 +1047,33 @@ class PieceFilterPanel(StatPanel):
 class AdvancedFilterPanel(ttk.Frame):
     """高级筛选面板: 支持多种筛选方式"""
 
-    def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar):
+    def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar,
+                 direction_getter=None, is_mainline_getter=None):
         super().__init__(parent, padding=4)
         self._folder_var = folder_var
         self._source_var = source_var
+        self._direction_getter = direction_getter or (lambda: "逆时针")
+        self._is_mainline_getter = is_mainline_getter or (lambda: False)
         self._build_ui()
 
     def _build_ui(self) -> None:
         # 子选项单选按钮
         self.sub_option_var = tk.StringVar(value="按组合条件筛选")
-        sub_options = ["按组合条件筛选", "按布阵文件筛选", "按手工布阵筛选"]
-        
+        sub_options = ["按组合条件筛选", "按布阵文件筛选"]
+
         option_frame = ttk.Frame(self)
         option_frame.pack(fill=tk.X, pady=(0, 10))
-        
+
         ttk.Label(option_frame, text="筛选方式:").pack(side=tk.LEFT)
         for option in sub_options:
-            ttk.Radiobutton(option_frame, text=option, value=option, 
+            ttk.Radiobutton(option_frame, text=option, value=option,
                            variable=self.sub_option_var,
                            command=self._on_sub_option_change).pack(side=tk.LEFT, padx=(10, 0))
-        
+
         # 内容区域
         self.content_frame = ttk.Frame(self)
         self.content_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         # 初始显示第一个子选项
         self._show_combination_filter()
 
@@ -824,14 +1082,12 @@ class AdvancedFilterPanel(ttk.Frame):
         # 清空内容区域
         for widget in self.content_frame.winfo_children():
             widget.destroy()
-        
+
         option = self.sub_option_var.get()
         if option == "按组合条件筛选":
             self._show_combination_filter()
         elif option == "按布阵文件筛选":
-            self._show_file_filter_placeholder()
-        elif option == "按手工布阵筛选":
-            self._show_manual_filter_placeholder()
+            self._show_file_filter()
 
     def _show_combination_filter(self) -> None:
         """显示按组合条件筛选界面"""
@@ -861,18 +1117,21 @@ class AdvancedFilterPanel(ttk.Frame):
         
         self.stat_btn = ttk.Button(button_frame, text="统计", command=self._start_combination_stat)
         self.stat_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
-        self.export_btn = ttk.Button(button_frame, text="导出", command=self._export_combination_results, state=tk.DISABLED)
-        self.export_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
+
+        self.export_layout_btn = ttk.Button(button_frame, text="导出布阵", command=self._export_layouts_dedup, state=tk.DISABLED)
+        self.export_layout_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.export_replay_btn = ttk.Button(button_frame, text="导出复盘", command=self._export_replays_dedup, state=tk.DISABLED)
+        self.export_replay_btn.pack(side=tk.LEFT, padx=(0, 10))
+
         self.clear_btn = ttk.Button(button_frame, text="清空所有勾选", command=self._clear_all_checkboxes)
         self.clear_btn.pack(side=tk.LEFT)
-        
+
         # 导出格式选择
         self.export_format_var = tk.StringVar(value="联众(jqs)")
         for fmt in ("联众(jqs)", "QQ(jql)"):
             ttk.Radiobutton(button_frame, text=fmt, value=fmt, variable=self.export_format_var).pack(side=tk.LEFT, padx=(4, 0))
-        
+
         # 结果显示区域
         self.result_var = tk.StringVar(value="请选择条件并点击统计")
         result_label = ttk.Label(button_frame, textvariable=self.result_var)
@@ -963,68 +1222,69 @@ class AdvancedFilterPanel(ttk.Frame):
         
         # 禁用按钮，显示进度
         self.stat_btn.config(state=tk.DISABLED)
-        self.export_btn.config(state=tk.DISABLED)
+        self.export_layout_btn.config(state=tk.DISABLED)
+        self.export_replay_btn.config(state=tk.DISABLED)
         self.result_var.set("统计中……")
-        
+
+        is_mainline = self._is_mainline_getter()
+        normal_mirror = self._direction_getter() == "顺时针" and not is_mainline
+
         # 后台线程统计
         def worker():
             try:
                 is_lianzhong = self._source_var.get() == "联众"
                 matched = []
                 total = 0
-                
+
                 if is_lianzhong:
-                    # 联众模式：解析 .jqh 文件
                     from src.lianzhong import decode_jqh_all_boards, get_char_to_itemtype
                     c2i = get_char_to_itemtype()
                     pattern = os.path.join(folder, "**", "*.jqh")
                     files = sorted(glob.glob(pattern, recursive=True))
                     total = len(files)
-                    
+
                     for i, jqh_file in enumerate(files):
                         try:
                             raw = open(jqh_file, "rb").read()
                             boards, _ = decode_jqh_all_boards(raw)
-                            
-                            # 检查每个颜色的布阵
                             for color, board in boards.items():
                                 if all(ch == "空" for row in board for ch in row):
                                     continue
-                                
-                                # 检查布阵是否匹配条件
-                                if self._match_layout_matrix(board, conditions, c2i):
+                                if is_mainline:
+                                    flag_col = self._find_flag_col_matrix(board, c2i)
+                                    mirror_this = (flag_col == 3)
+                                else:
+                                    mirror_this = normal_mirror
+                                if self._match_layout_matrix(board, conditions, c2i, mirror_this):
                                     matched.append((jqh_file, color, board))
-                        except Exception as e:
-                            pass  # 跳过解析失败的文件
-                        
-                        # 更新进度
+                        except Exception:
+                            pass
                         self.result_var.set(f"统计中…… {i+1}/{total}")
                 else:
-                    # QQ模式：解析 .jgs 文件
                     from src.layout_stats import find_jgs_files, load_total_info
                     files = find_jgs_files(folder)
                     total = len(files)
-                    
+
                     for i, jgs_file in enumerate(files):
                         try:
                             total_info = load_total_info(jgs_file)
                             for pib in total_info.player_info_block:
                                 layout = pib.player_layout
-                                # 检查布阵是否为空
-                                if all(layout.item(r, c) == ItemType.JQNone 
-                                       for r in range(JGSLayoutBlock.row_num) 
+                                if all(layout.item(r, c) == ItemType.JQNone
+                                       for r in range(JGSLayoutBlock.row_num)
                                        for c in range(JGSLayoutBlock.col_num)):
                                     continue
-                                
-                                # 检查布阵是否匹配条件
-                                if self._match_layout_block(layout, conditions):
+                                if is_mainline:
+                                    flag_col = self._find_flag_col_block(layout)
+                                    mirror_this = (flag_col == 3)
+                                else:
+                                    mirror_this = normal_mirror
+                                if self._match_layout_block(layout, conditions, mirror_this):
                                     matched.append((jgs_file, pib.player_color, layout))
-                        except Exception as e:
-                            pass  # 跳过解析失败的文件
-                        
-                        # 更新进度
+                        except Exception:
+                            pass
                         self.result_var.set(f"统计中…… {i+1}/{total}")
-                
+
                 self._stat_result = (matched, total, None)
             except Exception as e:
                 self._stat_result = ([], 0, str(e))
@@ -1033,20 +1293,40 @@ class AdvancedFilterPanel(ttk.Frame):
         self._worker.start()
         self.after(100, self._poll_stat_worker)
 
-    def _match_layout_block(self, layout: JGSLayoutBlock, conditions: dict) -> bool:
+    @staticmethod
+    def _find_flag_col_block(layout: JGSLayoutBlock) -> int:
+        """查找QQ布局中军旗所在列, 默认返回1(左)"""
+        for row in range(JGSLayoutBlock.row_num):
+            for col in range(JGSLayoutBlock.col_num):
+                if layout.item(row, col) == ItemType.Junqi:
+                    return col
+        return 1
+
+    @staticmethod
+    def _find_flag_col_matrix(board, c2i: dict) -> int:
+        """查找联众布局中军旗所在列, 默认返回1(左)"""
+        for row in range(len(board)):
+            for col in range(len(board[row])):
+                if c2i.get(board[row][col]) == ItemType.Junqi:
+                    return col
+        return 1
+
+    def _match_layout_block(self, layout: JGSLayoutBlock, conditions: dict, mirror: bool) -> bool:
         """检查QQ布阵是否匹配所有条件"""
         for (row, col), allowed_types in conditions.items():
-            piece = layout.item(row, col)
+            c = 4 - col if mirror else col
+            piece = layout.item(row, c)
             if piece not in allowed_types:
                 return False
         return True
 
-    def _match_layout_matrix(self, board: list[list[str]], conditions: dict, c2i: dict) -> bool:
+    def _match_layout_matrix(self, board: list[list[str]], conditions: dict, c2i: dict, mirror: bool) -> bool:
         """检查联众布阵是否匹配所有条件"""
         for (row, col), allowed_types in conditions.items():
-            if row >= len(board) or col >= len(board[row]):
+            c = 4 - col if mirror else col
+            if row >= len(board) or c >= len(board[row]):
                 return False
-            piece_name = board[row][col]
+            piece_name = board[row][c]
             piece_type = c2i.get(piece_name, ItemType.JQNone)
             if piece_type not in allowed_types:
                 return False
@@ -1054,150 +1334,572 @@ class AdvancedFilterPanel(ttk.Frame):
 
     def _poll_stat_worker(self) -> None:
         """轮询统计线程结果"""
-        if self._worker.is_alive():
-            self.after(100, self._poll_stat_worker)
-            return
-        
-        matched, total, err = self._stat_result
-        self.stat_btn.config(state=tk.NORMAL)
-        
-        if err is not None:
-            self.result_var.set(f"统计失败: {err}")
-            messagebox.showerror("错误", err)
-            return
-        
-        self.matched_layouts = matched
-        self.total_layouts = total
-        
-        if total == 0:
-            self.result_var.set("未找到布局文件")
-            messagebox.showinfo("提示", "该文件夹下未找到布局文件")
-            return
-        
-        # 计算匹配百分比
-        match_count = len(matched)
-        percentage = (match_count / total * 100) if total > 0 else 0
-        
-        self.result_var.set(f"匹配布局: {match_count}/{total} ({percentage:.1f}%)")
-        self.export_btn.config(state=tk.NORMAL if match_count > 0 else tk.DISABLED)
+        try:
+            if self._worker.is_alive():
+                self.after(100, self._poll_stat_worker)
+                return
+
+            matched, total, err = self._stat_result
+            if hasattr(self, 'stat_btn') and self.stat_btn.winfo_exists():
+                self.stat_btn.config(state=tk.NORMAL)
+
+            if err is not None:
+                self.result_var.set(f"统计失败: {err}")
+                messagebox.showerror("错误", err)
+                return
+
+            self.matched_layouts = matched
+            self.total_layouts = total
+
+            if total == 0:
+                self.result_var.set("未找到布局文件")
+                return
+
+            match_count = len(matched)
+            percentage = (match_count / total * 100) if total > 0 else 0
+            self.result_var.set(f"匹配布局: {match_count}/{total} ({percentage:.1f}%)")
+            has_match = match_count > 0
+            if hasattr(self, 'export_layout_btn') and self.export_layout_btn.winfo_exists():
+                self.export_layout_btn.config(state=tk.NORMAL if has_match else tk.DISABLED)
+            if hasattr(self, 'export_replay_btn') and self.export_replay_btn.winfo_exists():
+                self.export_replay_btn.config(state=tk.NORMAL if has_match else tk.DISABLED)
+        except Exception:
+            pass
 
     def _clear_all_checkboxes(self) -> None:
         """清空所有复选框"""
-        for var in self.checkbox_vars.values():
-            var.set(False)
-        self.result_var.set("请选择条件并点击统计")
-        self.export_btn.config(state=tk.DISABLED)
-
-    def _export_combination_results(self) -> None:
-        """导出匹配的布局为.jqs文件"""
-        if not self.matched_layouts:
-            messagebox.showwarning("提示", "没有可导出的布局")
-            return
-        
-        # 选择保存目录
-        save_dir = filedialog.askdirectory(title="选择导出目录", parent=self.winfo_toplevel())
-        if not save_dir:
-            return
-        
         try:
-            total_count = len(self.matched_layouts)
-            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
-            is_jqs = self.export_format_var.get() == "联众(jqs)"
-            
-            # JQS格式常量
-            JQS_HEADER = bytes([
-                0x47, 0x4C, 0xE9, 0x03, 0xCE, 0x07, 0xC4, 0x02, 0x53, 0x61, 0x74, 0x20,
-                0x41, 0x75, 0x67, 0x20, 0x30, 0x31, 0x20, 0x32, 0x32, 0x3A, 0x34, 0x35,
-                0x3A, 0x30, 0x33, 0x20, 0x32, 0x30, 0x32, 0x36, 0x0A, 0x00, 0x00, 0x00,
-                0x62, 0x79, 0x20, 0x5B, 0xD1, 0xD0, 0xBE, 0xBF, 0x31, 0x5D, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00
-            ])
+            for var in self.checkbox_vars.values():
+                var.set(False)
+            if hasattr(self, 'result_var'):
+                self.result_var.set("请选择条件并点击统计")
+            if hasattr(self, 'export_layout_btn') and self.export_layout_btn.winfo_exists():
+                self.export_layout_btn.config(state=tk.DISABLED)
+            if hasattr(self, 'export_replay_btn') and self.export_replay_btn.winfo_exists():
+                self.export_replay_btn.config(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def _get_export_constants(self):
+        """获取导出格式常量"""
+        JQS_HEADER = bytes([
+            0x47, 0x4C, 0xE9, 0x03, 0xCE, 0x07, 0xC4, 0x02, 0x53, 0x61, 0x74, 0x20,
+            0x41, 0x75, 0x67, 0x20, 0x30, 0x31, 0x20, 0x32, 0x32, 0x3A, 0x34, 0x35,
+            0x3A, 0x30, 0x33, 0x20, 0x32, 0x30, 0x32, 0x36, 0x0A, 0x00, 0x00, 0x00,
+            0x62, 0x79, 0x20, 0x5B, 0xD1, 0xD0, 0xBE, 0xBF, 0x31, 0x5D, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00
+        ])
+        PIECE_TO_JQS = {
+            ItemType.JQNone: 0x00, ItemType.Junzhang: 0x01, ItemType.Shizhang: 0x02,
+            ItemType.Lvzhang: 0x03, ItemType.Tuanzhang: 0x04, ItemType.Yinzhang: 0x05,
+            ItemType.Lianzhang: 0x06, ItemType.Paizhang: 0x07, ItemType.Gongbing: 0x08,
+            ItemType.Junqi: 0x09, ItemType.Silin: 0x0A, ItemType.Dilei: 0x0B,
+            ItemType.Zhadan: 0x0C,
+        }
+        JQL_HEADER = bytes([0x51, 0x51, 0x47, 0x61, 0x6D, 0x65, 0x20, 0x4A,
+                            0x51, 0x4C, 0x20, 0x46, 0x69, 0x6C, 0x65, 0x00,
+                            0x57, 0x04, 0x00, 0x00])
+        return JQS_HEADER, PIECE_TO_JQS, JQL_HEADER
+
+    def _write_layout_file(self, layout_data, output_path, is_jqs, JQS_HEADER, PIECE_TO_JQS, JQL_HEADER):
+        """将布阵数据写入文件"""
+        def get_piece_type(row, col):
+            if isinstance(layout_data, JGSLayoutBlock):
+                return layout_data.item(row, col)
+            else:
+                from src.lianzhong import get_char_to_itemtype
+                c2i = get_char_to_itemtype()
+                return c2i.get(layout_data[row][col], ItemType.JQNone)
+
+        if is_jqs:
             JQS_LAYOUT_OFFSET = 0x370
             JQS_ROW_STRIDE = 17
             JQS_FILE_SIZE = 1264
-            PIECE_TO_JQS = {
-                ItemType.JQNone: 0x00, ItemType.Junzhang: 0x01, ItemType.Shizhang: 0x02,
-                ItemType.Lvzhang: 0x03, ItemType.Tuanzhang: 0x04, ItemType.Yinzhang: 0x05,
-                ItemType.Lianzhang: 0x06, ItemType.Paizhang: 0x07, ItemType.Gongbing: 0x08,
-                ItemType.Junqi: 0x09, ItemType.Silin: 0x0A, ItemType.Dilei: 0x0B,
-                ItemType.Zhadan: 0x0C,
-            }
-            
-            # JQL格式常量
-            JQL_HEADER = bytes([0x51, 0x51, 0x47, 0x61, 0x6D, 0x65, 0x20, 0x4A,
-                                0x51, 0x4C, 0x20, 0x46, 0x69, 0x6C, 0x65, 0x00,
-                                0x57, 0x04, 0x00, 0x00])
+            data = bytearray(JQS_FILE_SIZE)
+            data[0:len(JQS_HEADER)] = JQS_HEADER
+            for row in range(6):
+                for col in range(5):
+                    offset = JQS_LAYOUT_OFFSET + (row * JQS_ROW_STRIDE + col) * 4
+                    pt = get_piece_type(row, col)
+                    code = 0x00 if (row, col) in CAMP_POSITIONS else PIECE_TO_JQS.get(pt, 0x00)
+                    struct.pack_into('<I', data, offset, code)
+        else:
             JQL_LAYOUT_OFFSET = 0x14
-            JQL_FILE_SIZE = 50  # 20 header + 30 layout
-            
-            exported_count = 0
-            for i, (file_path, color, layout_data) in enumerate(self.matched_layouts):
+            JQL_FILE_SIZE = 50
+            data = bytearray(JQL_FILE_SIZE)
+            data[0:20] = JQL_HEADER
+            for row in range(6):
+                for col in range(5):
+                    offset = JQL_LAYOUT_OFFSET + row * 5 + col
+                    pt = get_piece_type(row, col)
+                    data[offset] = int(pt)
+
+        with open(output_path, 'wb') as f:
+            f.write(data)
+
+    def _layout_to_key(self, layout_data) -> tuple:
+        """将布阵转换为可哈希的元组用于去重"""
+        if isinstance(layout_data, JGSLayoutBlock):
+            return tuple(layout_data.item(r, c) for r in range(6) for c in range(5))
+        else:
+            return tuple(layout_data[r][c] for r in range(6) for c in range(5))
+
+    def _export_layouts_dedup(self) -> None:
+        """导出布阵（按布阵内容去重）"""
+        if not self.matched_layouts:
+            messagebox.showwarning("提示", "没有可导出的布阵")
+            return
+
+        save_dir = filedialog.askdirectory(title="选择导出目录", parent=self.winfo_toplevel())
+        if not save_dir:
+            return
+
+        try:
+            is_jqs = self.export_format_var.get() == "联众(jqs)"
+            JQS_HEADER, PIECE_TO_JQS, JQL_HEADER = self._get_export_constants()
+            ext = ".jqs" if is_jqs else ".jql"
+
+            # 按布阵内容去重
+            seen_layouts = set()
+            unique_layouts = []
+            for file_path, color, layout_data in self.matched_layouts:
+                key = self._layout_to_key(layout_data)
+                if key not in seen_layouts:
+                    seen_layouts.add(key)
+                    unique_layouts.append((file_path, color, layout_data))
+
+            total_count = len(unique_layouts)
+            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
+
+            exported = 0
+            used_names = set()
+            for i, (file_path, color, layout_data) in enumerate(unique_layouts):
                 original_name = Path(file_path).stem
-                ext = ".jqs" if is_jqs else ".jql"
                 new_filename = f"{i:0{prefix_digits}d}_{original_name}{ext}"
+                # 避免同名文件
+                counter = 1
+                base_name = new_filename
+                while new_filename in used_names:
+                    name_part = Path(base_name).stem
+                    new_filename = f"{name_part}_{counter}{ext}"
+                    counter += 1
+                used_names.add(new_filename)
+
                 output_path = os.path.join(save_dir, new_filename)
-                
-                def get_piece_type(row, col):
-                    if isinstance(layout_data, JGSLayoutBlock):
-                        return layout_data.item(row, col)
-                    else:
-                        from src.lianzhong import get_char_to_itemtype
-                        c2i = get_char_to_itemtype()
-                        return c2i.get(layout_data[row][col], ItemType.JQNone)
-                
-                if is_jqs:
-                    # 联众jqs格式
-                    data = bytearray(JQS_FILE_SIZE)
-                    data[0:len(JQS_HEADER)] = JQS_HEADER
-                    for row in range(6):
-                        for col in range(5):
-                            offset = JQS_LAYOUT_OFFSET + (row * JQS_ROW_STRIDE + col) * 4
-                            pt = get_piece_type(row, col)
-                            code = 0x00 if (row, col) in CAMP_POSITIONS else PIECE_TO_JQS.get(pt, 0x00)
-                            struct.pack_into('<I', data, offset, code)
-                else:
-                    # QQ jql格式
-                    data = bytearray(JQL_FILE_SIZE)
-                    data[0:20] = JQL_HEADER
-                    for row in range(6):
-                        for col in range(5):
-                            offset = JQL_LAYOUT_OFFSET + row * 5 + col
-                            pt = get_piece_type(row, col)
-                            data[offset] = int(pt)  # ItemType值即QQ编码
-                
-                with open(output_path, 'wb') as f:
-                    f.write(data)
-                
-                exported_count += 1
-                self.result_var.set(f"导出中…… {exported_count}/{total_count}")
-            
-            messagebox.showinfo("完成", f"成功导出 {exported_count} 个布局文件到:\n{save_dir}")
-            self.result_var.set(f"已导出 {exported_count} 个布局文件")
-            
+                self._write_layout_file(layout_data, output_path, is_jqs, JQS_HEADER, PIECE_TO_JQS, JQL_HEADER)
+                exported += 1
+                self.result_var.set(f"导出中…… {exported}/{total_count}")
+
+            messagebox.showinfo("完成", f"成功导出 {exported} 个布阵文件(去重后)到:\n{save_dir}")
+            self.result_var.set(f"已导出 {exported} 个布阵文件")
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
             self.result_var.set(f"导出失败: {e}")
 
-    def _show_file_filter_placeholder(self) -> None:
-        """显示按布阵文件筛选占位符"""
-        ttk.Label(self.content_frame, text="按布阵文件筛选功能开发中...").pack(expand=True)
+    def _export_replays_dedup(self) -> None:
+        """导出复盘文件（按复盘文件去重）"""
+        if not self.matched_layouts:
+            messagebox.showwarning("提示", "没有可导出的复盘")
+            return
 
-    def _show_manual_filter_placeholder(self) -> None:
-        """显示按手工布阵筛选占位符"""
-        ttk.Label(self.content_frame, text="按手工布阵筛选功能开发中...").pack(expand=True)
+        save_dir = filedialog.askdirectory(title="选择导出目录", parent=self.winfo_toplevel())
+        if not save_dir:
+            return
+
+        try:
+            # 按复盘文件去重
+            seen_files = set()
+            unique_files = []
+            for file_path, color, layout_data in self.matched_layouts:
+                if file_path not in seen_files:
+                    seen_files.add(file_path)
+                    unique_files.append(file_path)
+
+            total_count = len(unique_files)
+            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
+
+            exported = 0
+            used_names = set()
+            for i, src_path in enumerate(unique_files):
+                original_name = Path(src_path).name
+                ext = Path(src_path).suffix
+                new_filename = f"{i:0{prefix_digits}d}_{original_name}"
+                # 避免同名文件
+                counter = 1
+                base_name = new_filename
+                while new_filename in used_names:
+                    name_part = Path(base_name).stem
+                    new_filename = f"{name_part}_{counter}{ext}"
+                    counter += 1
+                used_names.add(new_filename)
+
+                output_path = os.path.join(save_dir, new_filename)
+                import shutil
+                shutil.copy2(src_path, output_path)
+                exported += 1
+                self.result_var.set(f"导出中…… {exported}/{total_count}")
+
+            messagebox.showinfo("完成", f"成功导出 {exported} 个复盘文件(去重后)到:\n{save_dir}")
+            self.result_var.set(f"已导出 {exported} 个复盘文件")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+            self.result_var.set(f"导出失败: {e}")
+
+    def _show_file_filter(self) -> None:
+        """显示按布阵文件筛选界面"""
+        main_frame = ttk.Frame(self.content_frame)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 第一行: 加载布阵文件 + 状态
+        row1 = ttk.Frame(main_frame)
+        row1.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(row1, text="加载布阵文件", command=self._load_layout_file).pack(side=tk.LEFT)
+        self.file_filter_result_var = tk.StringVar(value="请加载 .jqs 或 .jql 布阵文件")
+        ttk.Label(row1, textvariable=self.file_filter_result_var).pack(side=tk.LEFT, padx=(10, 0))
+
+        # 第二行: 统计 + 导出 + 结果
+        row2 = ttk.Frame(main_frame)
+        row2.pack(fill=tk.X, pady=(0, 5))
+        self.file_stat_btn = ttk.Button(row2, text="统计匹配", command=self._start_file_filter_stat)
+        self.file_stat_btn.pack(side=tk.LEFT)
+        self.file_export_layout_btn = ttk.Button(row2, text="导出布阵", command=self._export_file_filter_layouts, state=tk.DISABLED)
+        self.file_export_layout_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.file_export_replay_btn = ttk.Button(row2, text="导出复盘", command=self._export_file_filter_replays, state=tk.DISABLED)
+        self.file_export_replay_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.file_filter_match_var = tk.StringVar(value="")
+        ttk.Label(row2, textvariable=self.file_filter_match_var).pack(side=tk.LEFT, padx=(15, 0))
+
+        # 布阵显示网格
+        self.file_layout_grid = ttk.Frame(main_frame)
+        self.file_layout_grid.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.file_layout_labels = []
+        for row in range(6):
+            row_labels = []
+            for col in range(5):
+                lbl = tk.Label(self.file_layout_grid, text="", bg="#FFFFFF",
+                               relief=tk.RIDGE, bd=1, font=("Consolas", 10),
+                               width=8, height=2)
+                lbl.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
+                row_labels.append(lbl)
+            self.file_layout_labels.append(row_labels)
+        for col in range(5):
+            self.file_layout_grid.columnconfigure(col, weight=1)
+
+        self._loaded_layout = None
+        self._loaded_layout_source = ""
+        self._file_filter_matched = []
+
+    def _load_layout_file(self) -> None:
+        """加载布阵文件 (.jqs 或 .jql)"""
+        file_path = filedialog.askopenfilename(
+            title="选择布阵文件",
+            filetypes=[("布阵文件", "*.jqs *.jql"), ("联众布阵", "*.jqs"), ("QQ布阵", "*.jql")],
+            parent=self.winfo_toplevel())
+        if not file_path:
+            return
+
+        try:
+            ext = Path(file_path).suffix.lower()
+            raw = open(file_path, "rb").read()
+
+            if ext == ".jqs":
+                from src.lianzhong import parse_jqs_layout, JQS_CODE_MAP
+                board_str = parse_jqs_layout(raw)
+                # 转换为 ItemType 矩阵
+                from src.lianzhong import get_char_to_itemtype
+                c2i = get_char_to_itemtype()
+                self._loaded_layout = [[c2i.get(ch, ItemType.JQNone) for ch in row] for row in board_str]
+                self._loaded_layout_source = "联众"
+            elif ext == ".jql":
+                JQL_LAYOUT_OFFSET = 0x14
+                layout = []
+                for row in range(6):
+                    row_items = []
+                    for col in range(5):
+                        offset = JQL_LAYOUT_OFFSET + row * 5 + col
+                        v = raw[offset] if offset < len(raw) else 0
+                        try:
+                            row_items.append(ItemType(v))
+                        except ValueError:
+                            row_items.append(ItemType.JQNone)
+                    layout.append(row_items)
+                self._loaded_layout = layout
+                self._loaded_layout_source = "QQ"
+            else:
+                messagebox.showerror("错误", f"不支持的文件格式: {ext}")
+                return
+
+            # 显示布阵
+            self._display_loaded_layout()
+            self.file_filter_result_var.set(
+                f"已加载 {Path(file_path).name} ({self._loaded_layout_source}格式)")
+            self.file_filter_match_var.set("")
+            self._file_filter_matched = []
+            self.file_export_layout_btn.config(state=tk.DISABLED)
+            self.file_export_replay_btn.config(state=tk.DISABLED)
+
+        except Exception as e:
+            messagebox.showerror("加载失败", str(e))
+
+    def _display_loaded_layout(self) -> None:
+        """在网格中显示已加载的布阵"""
+        from src.jgs_types import item_type2string
+        CAMP_POSITIONS = {(1, 1), (1, 3), (2, 2), (3, 1), (3, 3)}
+        for row in range(6):
+            for col in range(5):
+                lbl = self.file_layout_labels[row][col]
+                if (row, col) in CAMP_POSITIONS:
+                    lbl.config(text="", bg="#D0D0D0")
+                elif self._loaded_layout:
+                    pt = self._loaded_layout[row][col]
+                    lbl.config(text=item_type2string(pt), bg="#FFFFFF")
+                else:
+                    lbl.config(text="", bg="#FFFFFF")
+
+    def _start_file_filter_stat(self) -> None:
+        """开始按布阵文件筛选统计"""
+        if self._loaded_layout is None:
+            messagebox.showwarning("提示", "请先加载布阵文件")
+            return
+
+        folder = self._folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning("提示", "请先选择有效的文件夹")
+            return
+
+        self.file_stat_btn.config(state=tk.DISABLED)
+        self.file_export_layout_btn.config(state=tk.DISABLED)
+        self.file_export_replay_btn.config(state=tk.DISABLED)
+        self.file_filter_match_var.set("统计中……")
+
+        target_layout = self._loaded_layout
+        progress = [0]  # [processed]
+        total_ref = [0]  # [total]
+
+        def update_progress():
+            self.file_filter_match_var.set(f"统计中…… {progress[0]}/{total_ref[0]}")
+
+        def worker():
+            try:
+                matched = []
+
+                # 搜索 .jgs 文件
+                from src.layout_stats import find_jgs_files, load_total_info, _layout_is_empty
+                from src.layout_stats import CAMP_POSITIONS as CP
+                jgs_files = find_jgs_files(folder)
+                total_ref[0] += len(jgs_files)
+                for jgs_file in jgs_files:
+                    try:
+                        total_info = load_total_info(jgs_file)
+                        for pib in total_info.player_info_block:
+                            layout = pib.player_layout
+                            if _layout_is_empty(layout):
+                                continue
+                            if self._match_layout_vs_target(layout, target_layout, CP):
+                                matched.append((jgs_file, "QQ", layout))
+                    except Exception:
+                        pass
+                    progress[0] += 1
+
+                # 搜索 .jqh 文件
+                from src.lianzhong import decode_jqh_all_boards, get_char_to_itemtype
+                c2i = get_char_to_itemtype()
+                pattern = os.path.join(folder, "**", "*.jqh")
+                jqh_files = sorted(glob.glob(pattern, recursive=True))
+                total_ref[0] += len(jqh_files)
+                for jqh_file in jqh_files:
+                    try:
+                        raw = open(jqh_file, "rb").read()
+                        boards, _ = decode_jqh_all_boards(raw)
+                        for color, board in boards.items():
+                            if all(ch == "空" for row in board for ch in row):
+                                continue
+                            board_types = [[c2i.get(ch, ItemType.JQNone) for ch in row] for row in board]
+                            if self._match_layout_vs_target_matrix(board_types, target_layout, CP):
+                                matched.append((jqh_file, color, board_types))
+                    except Exception:
+                        pass
+                    progress[0] += 1
+
+                self._file_filter_result = (matched, total_ref[0], None)
+            except Exception as e:
+                self._file_filter_result = ([], 0, str(e))
+
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
+        self._progress_timer = self.after(200, self._update_file_filter_progress, progress, total_ref)
+        self.after(100, self._poll_file_filter_worker)
+
+    def _update_file_filter_progress(self, progress, total_ref):
+        """更新进度显示"""
+        if hasattr(self, '_worker') and self._worker.is_alive():
+            self.file_filter_match_var.set(f"统计中…… {progress[0]}/{total_ref[0]}")
+            self._progress_timer = self.after(200, self._update_file_filter_progress, progress, total_ref)
+
+    def _match_layout_vs_target(self, layout, target, camp_positions) -> bool:
+        """检查QQ布阵是否与目标布阵完全匹配"""
+        for row in range(6):
+            for col in range(5):
+                if (row, col) in camp_positions:
+                    continue
+                if layout.item(row, col) != target[row][col]:
+                    return False
+        return True
+
+    def _match_layout_vs_target_matrix(self, board_types, target, camp_positions) -> bool:
+        """检查联众布阵是否与目标布阵完全匹配"""
+        for row in range(6):
+            for col in range(5):
+                if (row, col) in camp_positions:
+                    continue
+                if board_types[row][col] != target[row][col]:
+                    return False
+        return True
+
+    def _poll_file_filter_worker(self) -> None:
+        try:
+            if self._worker.is_alive():
+                self.after(100, self._poll_file_filter_worker)
+                return
+
+            matched, total, err = self._file_filter_result
+            if hasattr(self, 'file_stat_btn') and self.file_stat_btn.winfo_exists():
+                self.file_stat_btn.config(state=tk.NORMAL)
+
+            if err:
+                self.file_filter_match_var.set(f"统计失败: {err}")
+                messagebox.showerror("错误", err)
+                return
+
+            self._file_filter_matched = matched
+            match_count = len(matched)
+            self.file_filter_match_var.set(f"匹配: {match_count}/{total} 文件")
+            has_match = match_count > 0
+            if hasattr(self, 'file_export_layout_btn') and self.file_export_layout_btn.winfo_exists():
+                self.file_export_layout_btn.config(state=tk.NORMAL if has_match else tk.DISABLED)
+            if hasattr(self, 'file_export_replay_btn') and self.file_export_replay_btn.winfo_exists():
+                self.file_export_replay_btn.config(state=tk.NORMAL if has_match else tk.DISABLED)
+        except Exception:
+            pass
+
+    def _export_file_filter_layouts(self) -> None:
+        """导出按布阵文件筛选的布阵（按布阵内容去重）"""
+        if not self._file_filter_matched:
+            messagebox.showwarning("提示", "没有可导出的布阵")
+            return
+
+        top = self.winfo_toplevel()
+        geo = top.geometry()
+        save_dir = filedialog.askdirectory(title="选择导出目录", parent=top)
+        top.geometry(geo)
+        if not save_dir:
+            return
+    
+        try:
+            # 按布阵内容去重
+            seen = set()
+            unique = []
+            for file_path, source, layout_data in self._file_filter_matched:
+                key = tuple(layout_data[r][c] for r in range(6) for c in range(5))
+                if key not in seen:
+                    seen.add(key)
+                    unique.append((file_path, source, layout_data))
+    
+            total_count = len(unique)
+            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
+    
+            exported = 0
+            used_names = set()
+            for i, (file_path, source, layout_data) in enumerate(unique):
+                original_name = Path(file_path).stem
+                new_filename = f"{i:0{prefix_digits}d}_{original_name}.txt"
+                counter = 1
+                base = new_filename
+                while new_filename in used_names:
+                    new_filename = f"{Path(base).stem}_{counter}.txt"
+                    counter += 1
+                used_names.add(new_filename)
+    
+                output_path = os.path.join(save_dir, new_filename)
+                from src.jgs_types import item_type2string
+                lines = [f"来源: {source}"]
+                for row in range(6):
+                    line = " ".join(item_type2string(layout_data[row][col]) for col in range(5))
+                    lines.append(line)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+                exported += 1
+    
+            messagebox.showinfo("完成", f"成功导出 {exported} 个布阵文件(去重后)到:\n{save_dir}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+    
+    def _export_file_filter_replays(self) -> None:
+        """导出按布阵文件筛选的复盘文件（按文件去重）"""
+        if not self._file_filter_matched:
+            messagebox.showwarning("提示", "没有可导出的复盘")
+            return
+
+        top = self.winfo_toplevel()
+        geo = top.geometry()
+        save_dir = filedialog.askdirectory(title="选择导出目录", parent=top)
+        top.geometry(geo)
+        if not save_dir:
+            return
+    
+        try:
+            seen_files = set()
+            unique_files = []
+            for file_path, source, layout_data in self._file_filter_matched:
+                if file_path not in seen_files:
+                    seen_files.add(file_path)
+                    unique_files.append(file_path)
+    
+            total_count = len(unique_files)
+            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
+    
+            exported = 0
+            used_names = set()
+            import shutil
+            for i, src_path in enumerate(unique_files):
+                original_name = Path(src_path).name
+                ext = Path(src_path).suffix
+                new_filename = f"{i:0{prefix_digits}d}_{original_name}"
+                counter = 1
+                base = new_filename
+                while new_filename in used_names:
+                    new_filename = f"{Path(base).stem}_{counter}{ext}"
+                    counter += 1
+                used_names.add(new_filename)
+    
+                output_path = os.path.join(save_dir, new_filename)
+                shutil.copy2(src_path, output_path)
+                exported += 1
+    
+            messagebox.showinfo("完成", f"成功导出 {exported} 个复盘文件(去重后)到:\n{save_dir}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
 
     def clear_stats(self) -> None:
         """清空统计结果"""
-        pass
+        self.matched_layouts = []
+        self.total_layouts = 0
+        try:
+            if hasattr(self, 'result_var'):
+                self.result_var.set("请选择条件并点击统计")
+            if hasattr(self, 'export_btn') and self.export_btn.winfo_exists():
+                self.export_btn.config(state=tk.DISABLED)
+        except Exception:
+            pass
 
     def _refresh_grid(self) -> None:
-        """刷新网格（高级筛选面板没有网格）"""
-        pass
+        """方向变化时清空结果"""
+        self.clear_stats()
 
 
 class ConditionalProbabilityPanel(ttk.Frame):
@@ -1222,11 +1924,13 @@ class ConditionalProbabilityPanel(ttk.Frame):
     CELL_ROLES = {"条件": "#CC0000", "结果": "#00AA00", "忽略": "#000000"}
 
     def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar,
-                 display_mode_getter=None):
+                 display_mode_getter=None, direction_getter=None, is_mainline_getter=None):
         super().__init__(parent, padding=4)
         self._folder_var = folder_var
         self._source_var = source_var
         self._display_mode_getter = display_mode_getter or (lambda: "百分比")
+        self._direction_getter = direction_getter or (lambda: "逆时针")
+        self._is_mainline_getter = is_mainline_getter or (lambda: False)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1252,6 +1956,9 @@ class ConditionalProbabilityPanel(ttk.Frame):
         self.checkbox_vars = {}      # {(row, col, piece_name): tk.BooleanVar}
         self.cell_cb_frames = {}     # {(row, col): ttk.Frame} 棋子复选框容器
         self.cell_result_labels = {} # {(row, col): ttk.Label} 结果显示标签
+        self.cell_frames = {}        # {(row, col): ttk.LabelFrame} 格子容器
+        self.cell_role_frames = {}   # {(row, col): ttk.Frame} 角色选择容器
+        self.flag_label = None       # 旗侧视角下(5,1)的旗标签
 
         for row in range(6):
             for col in range(5):
@@ -1262,12 +1969,14 @@ class ConditionalProbabilityPanel(ttk.Frame):
 
                 cell_frame = ttk.LabelFrame(grid_frame, text=f"({row+1},{col+1})")
                 cell_frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+                self.cell_frames[(row, col)] = cell_frame
 
                 # 角色三选一: 条件/结果/忽略
                 role_var = tk.StringVar(value="忽略")
                 self.cell_role_vars[(row, col)] = role_var
                 role_frame = ttk.Frame(cell_frame)
                 role_frame.pack(fill=tk.X, padx=2, pady=(2, 0))
+                self.cell_role_frames[(row, col)] = role_frame
                 for role_name in ("条件", "结果", "忽略"):
                     ttk.Radiobutton(role_frame, text=role_name, value=role_name,
                                     variable=role_var,
@@ -1322,6 +2031,41 @@ class ConditionalProbabilityPanel(ttk.Frame):
         elif role == "结果":
             result_lbl.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
 
+    def update_for_direction(self) -> None:
+        """根据方向模式更新格子显示状态
+        旗侧视角下(5,1)位置显示旗、灰色、隐藏radiobutton"""
+        is_mainline = self._is_mainline_getter()
+        target = (5, 1)
+
+        if target not in self.cell_frames:
+            return
+
+        cell_frame = self.cell_frames[target]
+        role_frame = self.cell_role_frames[target]
+        role_var = self.cell_role_vars[target]
+        cb_frame = self.cell_cb_frames[target]
+        result_lbl = self.cell_result_labels[target]
+
+        if is_mainline:
+            # 旗侧视角: (5,1) 显示旗、灰色、隐藏所有交互
+            role_var.set("忽略")
+            cb_frame.pack_forget()
+            result_lbl.pack_forget()
+            role_frame.pack_forget()
+            if self.flag_label is None:
+                self.flag_label = ttk.Label(cell_frame, text="旗", anchor=tk.CENTER,
+                                            font=("", 14, "bold"))
+            self.flag_label.pack(fill=tk.BOTH, expand=True)
+            cell_frame.config(text="(6,2) 旗侧")
+        else:
+            # 其它方向: 恢复正常显示
+            if self.flag_label is not None:
+                self.flag_label.pack_forget()
+            role_frame.pack(fill=tk.X, padx=2, pady=(2, 0))
+            cell_frame.config(text=f"(6,2)")
+            # 恢复当前角色的显示
+            self._on_role_change(5, 1)
+
     def _clear_all(self) -> None:
         """清空所有角色和棋子勾选，复位为忽略"""
         for (row, col), role_var in self.cell_role_vars.items():
@@ -1334,6 +2078,49 @@ class ConditionalProbabilityPanel(ttk.Frame):
             var.set(False)
         self.result_var.set("选择条件/结果格子后点击统计")
 
+    @staticmethod
+    def _mirror_col(col: int) -> int:
+        """镜像列: 0↔4, 1↔3, 2不变"""
+        return 4 - col
+
+    def _get_mirror_flag(self) -> bool:
+        """根据方向返回是否需要镜像布局数据
+        逆时针: 不镜像
+        顺时针: 镜像
+        旗侧视角: 不镜像(由调用方处理左右旗合并)"""
+        direction = self._direction_getter()
+        if self._is_mainline_getter():
+            return False
+        return direction == "顺时针"
+
+    def _get_piece_from_layout(self, layout, row: int, col: int, mirror: bool):
+        """从QQ布局获取棋子, 支持镜像"""
+        c = self._mirror_col(col) if mirror else col
+        return layout.item(row, c)
+
+    def _get_piece_from_matrix(self, board, row: int, col: int, mirror: bool, c2i: dict):
+        """从联众矩阵获取棋子, 支持镜像"""
+        c = self._mirror_col(col) if mirror else col
+        if row >= len(board) or c >= len(board[row]):
+            return ItemType.JQNone
+        return c2i.get(board[row][c], ItemType.JQNone)
+
+    def _check_conditions_block(self, layout, conditions: dict, mirror: bool) -> bool:
+        """检查QQ布局是否匹配条件"""
+        for (row, col), allowed in conditions.items():
+            piece = self._get_piece_from_layout(layout, row, col, mirror)
+            if piece not in allowed:
+                return False
+        return True
+
+    def _check_conditions_matrix(self, board, conditions: dict, mirror: bool, c2i: dict) -> bool:
+        """检查联众布局是否匹配条件"""
+        for (row, col), allowed in conditions.items():
+            piece = self._get_piece_from_matrix(board, row, col, mirror, c2i)
+            if piece not in allowed:
+                return False
+        return True
+
     def _start_stat(self) -> None:
         """开始条件概率统计"""
         folder = self._folder_var.get().strip()
@@ -1341,9 +2128,9 @@ class ConditionalProbabilityPanel(ttk.Frame):
             messagebox.showwarning("提示", "请先选择有效的文件夹")
             return
 
-        # 收集条件格子 (有棋子勾选的"条件"格子)
-        conditions = {}  # {(row, col): set(piece_type)}
-        result_cells = set()  # {(row, col)}
+        # 收集条件格子 (显示坐标)
+        conditions = {}
+        result_cells = set()
         PIECE_NAME_TO_TYPE = {name: pt for name, pt in self.PIECE_OPTIONS}
 
         for (row, col), role_var in self.cell_role_vars.items():
@@ -1369,7 +2156,10 @@ class ConditionalProbabilityPanel(ttk.Frame):
         self.result_var.set("统计中……")
 
         is_lianzhong = self._source_var.get() == "联众"
+        is_mainline = self._is_mainline_getter()
         show_pct = self._display_mode_getter() == "百分比"
+        # 逆时针不镜像, 顺时针镜像 (旗侧视角由特殊逻辑处理)
+        normal_mirror = self._get_mirror_flag()
 
         def worker():
             try:
@@ -1391,12 +2181,19 @@ class ConditionalProbabilityPanel(ttk.Frame):
                             for color, board in boards.items():
                                 if all(ch == "空" for row in board for ch in row):
                                     continue
-                                if self._match_matrix(board, conditions, c2i):
+
+                                if is_mainline:
+                                    # 旗侧视角: 判断旗位置决定是否镜像
+                                    flag_col = self._find_flag_col_matrix(board, c2i)
+                                    mirror_this = (flag_col == 3)  # 右旗镜像
+                                else:
+                                    mirror_this = normal_mirror
+
+                                if self._check_conditions_matrix(board, conditions, mirror_this, c2i):
                                     match_total += 1
                                     for rc in result_cells:
                                         r, c = rc
-                                        piece_name = board[r][c]
-                                        pt = c2i.get(piece_name, ItemType.JQNone)
+                                        pt = self._get_piece_from_matrix(board, r, c, mirror_this, c2i)
                                         result_counts[rc][pt] = result_counts[rc].get(pt, 0) + 1
                         except Exception:
                             pass
@@ -1415,11 +2212,19 @@ class ConditionalProbabilityPanel(ttk.Frame):
                                        for r in range(JGSLayoutBlock.row_num)
                                        for c in range(JGSLayoutBlock.col_num)):
                                     continue
-                                if self._match_block(layout, conditions):
+
+                                if is_mainline:
+                                    # 旗侧视角: 判断旗位置决定是否镜像
+                                    flag_col = self._find_flag_col_block(layout)
+                                    mirror_this = (flag_col == 3)  # 右旗镜像
+                                else:
+                                    mirror_this = normal_mirror
+
+                                if self._check_conditions_block(layout, conditions, mirror_this):
                                     match_total += 1
                                     for rc in result_cells:
                                         r, c = rc
-                                        pt = layout.item(r, c)
+                                        pt = self._get_piece_from_layout(layout, r, c, mirror_this)
                                         result_counts[rc][pt] = result_counts[rc].get(pt, 0) + 1
                         except Exception:
                             pass
@@ -1433,20 +2238,23 @@ class ConditionalProbabilityPanel(ttk.Frame):
         self._worker.start()
         self.after(100, self._poll_worker)
 
-    def _match_block(self, layout: JGSLayoutBlock, conditions: dict) -> bool:
-        for (row, col), allowed in conditions.items():
-            if layout.item(row, col) not in allowed:
-                return False
-        return True
+    @staticmethod
+    def _find_flag_col_block(layout: JGSLayoutBlock) -> int:
+        """查找QQ布局中军旗所在列, 默认返回1(左)"""
+        for row in range(JGSLayoutBlock.row_num):
+            for col in range(JGSLayoutBlock.col_num):
+                if layout.item(row, col) == ItemType.Junqi:
+                    return col
+        return 1
 
-    def _match_matrix(self, board, conditions, c2i) -> bool:
-        for (row, col), allowed in conditions.items():
-            if row >= len(board) or col >= len(board[row]):
-                return False
-            pt = c2i.get(board[row][col], ItemType.JQNone)
-            if pt not in allowed:
-                return False
-        return True
+    @staticmethod
+    def _find_flag_col_matrix(board, c2i: dict) -> int:
+        """查找联众布局中军旗所在列, 默认返回1(左)"""
+        for row in range(len(board)):
+            for col in range(len(board[row])):
+                if c2i.get(board[row][col]) == ItemType.Junqi:
+                    return col
+        return 1
 
     def _poll_worker(self) -> None:
         if self._worker.is_alive():
@@ -1464,18 +2272,24 @@ class ConditionalProbabilityPanel(ttk.Frame):
             self.result_var.set(f"无匹配布阵 (总文件: {total})")
             return
 
-        # 在结果格子里显示频率分布
+        # 在结果格子里显示频率分布 (每行两个棋子)
         from src.jgs_types import item_type2string
         for rc, counts in result_counts.items():
             total_count = sum(counts.values())
             if total_count == 0:
                 continue
             sorted_items = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+            # 每行两个棋子
             lines = []
-            for pt, cnt in sorted_items:
-                ratio = cnt / total_count
-                val = f"{ratio*100:5.1f}%" if show_pct else str(cnt)
-                lines.append(f"{item_type2string(pt)}:{val}")
+            for i in range(0, len(sorted_items), 2):
+                parts = []
+                for j in range(2):
+                    if i + j < len(sorted_items):
+                        pt, cnt = sorted_items[i + j]
+                        ratio = cnt / total_count
+                        val = f"{ratio*100:5.1f}%" if show_pct else str(cnt)
+                        parts.append(f"{item_type2string(pt)}:{val}")
+                lines.append("  ".join(parts))
             # 更新结果标签
             result_lbl = self.cell_result_labels.get(rc)
             if result_lbl:
@@ -1488,7 +2302,14 @@ class ConditionalProbabilityPanel(ttk.Frame):
         self._clear_all()
 
     def _refresh_grid(self) -> None:
-        pass
+        """方向变化时清空结果（结果与镜像设置绑定）"""
+        self._clear_result_labels()
+
+    def _clear_result_labels(self) -> None:
+        """清空所有结果标签内容"""
+        for rc, lbl in self.cell_result_labels.items():
+            lbl.config(text="")
+        self.result_var.set("选择条件/结果格子后点击统计")
 
 
 class StatsGUI:
@@ -1562,8 +2383,11 @@ class StatsGUI:
         return self.direction_var.get() == "顺时针"
 
     def _on_source_change(self) -> None:
-        """切换联众/QQ模式: 联众=棋子维度+联众颜色, QQ=全部四个tab"""
+        """切换联众/QQ模式, 保持选项卡对应位置"""
         is_lianzhong = self.source_var.get() == "联众"
+
+        # 记住当前选中的tab
+        current_idx = self.notebook.index(self.notebook.select())
 
         # 切换默认方向: 如果当前是主线模式则保留, 否则设默认
         if not self._is_mainline():
@@ -1572,40 +2396,53 @@ class StatsGUI:
             else:
                 self.direction_var.set("逆时针")
 
-        # QQ tabs (index 1, 3): 颜色、QQ号码 (主视角index=2始终隐藏)
+        # QQ专属 tabs (index 1, 3)
         for i in (1, 3):
             self.notebook.tab(i, state="hidden" if is_lianzhong else "normal")
         # 主视角 tab (index 2) 始终隐藏
         self.notebook.tab(2, state="hidden")
-        # 联众颜色 tab (index 4)
-        self.notebook.tab(4, state="normal" if is_lianzhong else "hidden")
-        # 棋子维度 tab (index 0) 始终显示
-        self.notebook.tab(0, state="normal")
-        # 高级筛选 tab (index 5) 始终显示
-        self.notebook.tab(5, state="normal")
-        # 条件概率筛选 tab (index 6) 始终显示
-        self.notebook.tab(6, state="normal")
-        self.notebook.select(0)
+        # 联众专属 tabs (index 4, 5, 6)
+        for i in (4, 5, 6):
+            self.notebook.tab(i, state="normal" if is_lianzhong else "hidden")
+        # 公共 tabs 始终显示
+        for i in (0, 7, 8):
+            self.notebook.tab(i, state="normal")
+
+        # 根据映射关系选择对应的tab
+        if is_lianzhong:
+            target_idx = self._qq_to_lz_tab.get(current_idx, 4)
+        else:
+            target_idx = self._lz_to_qq_tab.get(current_idx, 1)
+        # 确保目标tab可见
+        try:
+            self.notebook.select(target_idx)
+        except Exception:
+            self.notebook.select(0)
 
         # 清空所有统计结果
         self._clear_all_stats()
 
     def _clear_all_stats(self) -> None:
         """清空所有面板的统计结果"""
-        for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel, 
-                     self.piece_panel, self.advanced_filter_panel, self.conditional_panel):
+        for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
+                     self.lz_id_panel, self.lz_first_panel, self.piece_panel,
+                     self.advanced_filter_panel, self.conditional_panel):
             panel.clear_stats()
 
     def _on_direction_change(self) -> None:
         # 重绘所有已有统计结果的面板
-        for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel, 
-                     self.piece_panel, self.advanced_filter_panel, self.conditional_panel):
+        for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
+                     self.lz_id_panel, self.lz_first_panel, self.piece_panel,
+                     self.advanced_filter_panel, self.conditional_panel):
             panel._refresh_grid()
+        # 条件概率面板: 更新旗侧视角下(5,1)位置的显示
+        self.conditional_panel.update_for_direction()
 
     def _on_display_mode_change(self) -> None:
         """切换百分比/数量显示模式"""
-        for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel, 
-                     self.piece_panel, self.advanced_filter_panel, self.conditional_panel):
+        for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
+                     self.lz_id_panel, self.lz_first_panel, self.piece_panel,
+                     self.advanced_filter_panel, self.conditional_panel):
             panel._refresh_grid()
 
     def _build_tabs(self) -> None:
@@ -1628,7 +2465,7 @@ class StatsGUI:
             self.notebook, self.folder_var, export_name="layout_stats_颜色.xlsx",
             mirror_getter=self._is_clockwise, mainline_getter=self._is_mainline,
             dedup_getter=dedup_getter, display_mode_getter=display_mode_getter)
-        self.notebook.add(self.color_panel, text="颜色(兼座次)统计")
+        self.notebook.add(self.color_panel, text="QQ颜色(兼座次)统计")
 
         # 主视角统计 (index=2, 仅QQ, 默认隐藏)
         self.view_panel = PerspectivePanel(
@@ -1654,16 +2491,40 @@ class StatsGUI:
         self.notebook.add(self.lz_panel, text="颜色统计")
         self.notebook.tab(4, state="hidden")
 
-        # 高级筛选 (index=5, 始终显示)
+        # 联众先手方视角 (index=5, 初始隐藏)
+        self.lz_first_panel = LianzhongFirstPanel(
+            self.notebook, self.folder_var, export_name="layout_stats_先手方.xlsx",
+            mirror_getter=self._should_mirror, mainline_getter=self._is_mainline,
+            dedup_getter=dedup_getter, display_mode_getter=display_mode_getter)
+        self.notebook.add(self.lz_first_panel, text="先手方视角")
+        self.notebook.tab(5, state="hidden")
+
+        # 联众ID统计 (index=6, 初始隐藏)
+        self.lz_id_panel = LianzhongIDPanel(
+            self.notebook, self.folder_var, export_name="layout_stats_联众ID.xlsx",
+            mirror_getter=self._should_mirror, mainline_getter=self._is_mainline,
+            dedup_getter=dedup_getter, display_mode_getter=display_mode_getter)
+        self.notebook.add(self.lz_id_panel, text="联众ID统计")
+        self.notebook.tab(6, state="hidden")
+
+        # 高级筛选 (index=7, 始终显示)
         self.advanced_filter_panel = AdvancedFilterPanel(
-            self.notebook, self.folder_var, self.source_var)
+            self.notebook, self.folder_var, self.source_var,
+            direction_getter=lambda: self.direction_var.get(),
+            is_mainline_getter=self._is_mainline)
         self.notebook.add(self.advanced_filter_panel, text="高级筛选")
 
-        # 条件概率筛选 (index=6, 始终显示)
+        # 条件概率筛选 (index=8, 始终显示)
         self.conditional_panel = ConditionalProbabilityPanel(
             self.notebook, self.folder_var, self.source_var,
-            display_mode_getter=display_mode_getter)
+            display_mode_getter=display_mode_getter,
+            direction_getter=lambda: self.direction_var.get(),
+            is_mainline_getter=self._is_mainline)
         self.notebook.add(self.conditional_panel, text="条件概率筛选")
+
+        # QQ/联众选项卡对应关系 (用于切换平台时保持位置)
+        self._qq_to_lz_tab = {1: 4, 3: 6}  # QQ index -> 联众 index
+        self._lz_to_qq_tab = {4: 1, 5: 1, 6: 3}  # 联众 index -> QQ index
 
     def _choose_folder(self) -> None:
         folder = filedialog.askdirectory(title="选择包含 .jgs/.jqh 复盘的文件夹", parent=self.root)
