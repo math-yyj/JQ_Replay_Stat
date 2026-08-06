@@ -1591,7 +1591,10 @@ class AdvancedFilterPanel(ttk.Frame):
             messagebox.showwarning("提示", "没有可导出的布阵", parent=self._top)
             return
 
-        save_dir = filedialog.askdirectory(title="选择导出目录", parent=self.winfo_toplevel())
+        top = self.winfo_toplevel()
+        geo = top.geometry()
+        save_dir = filedialog.askdirectory(title="选择导出目录", parent=top)
+        top.geometry(geo)
         if not save_dir:
             return
 
@@ -1643,7 +1646,10 @@ class AdvancedFilterPanel(ttk.Frame):
             messagebox.showwarning("提示", "没有可导出的复盘", parent=self._top)
             return
 
-        save_dir = filedialog.askdirectory(title="选择导出目录", parent=self.winfo_toplevel())
+        top = self.winfo_toplevel()
+        geo = top.geometry()
+        save_dir = filedialog.askdirectory(title="选择导出目录", parent=top)
+        top.geometry(geo)
         if not save_dir:
             return
 
