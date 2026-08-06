@@ -2056,22 +2056,6 @@ class ConditionalProbabilityPanel(BasePanel):
         ("旗", ItemType.Junqi),
     ]
 
-    # 归一化因子: 一副完整棋子里每种棋子的个数
-    NORMALIZE_FACTOR = {
-        ItemType.Silin: 1.0,      # 司
-        ItemType.Junzhang: 1.0,   # 军
-        ItemType.Shizhang: 2.0,   # 师
-        ItemType.Lvzhang: 2.0,    # 旅
-        ItemType.Tuanzhang: 2.0,  # 团
-        ItemType.Yinzhang: 2.0,   # 营
-        ItemType.Lianzhang: 3.0,  # 连
-        ItemType.Paizhang: 3.0,   # 排
-        ItemType.Gongbing: 3.0,   # 兵
-        ItemType.Zhadan: 2.0,     # 弹
-        ItemType.Dilei: 3.0,      # 雷
-        ItemType.Junqi: 1.0,      # 旗
-    }
-
     def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar,
                  display_mode_getter=None, direction_getter=None, is_mainline_getter=None):
         super().__init__(parent, padding=2)
@@ -2563,15 +2547,8 @@ class ConditionalProbabilityPanel(BasePanel):
             if total_count == 0:
                 continue
 
-            # 归一化: 仅用于排序和百分比计算
-            normalized = {}
-            for pt, cnt in counts.items():
-                factor = self.NORMALIZE_FACTOR.get(pt, 1.0)
-                normalized[pt] = cnt / factor
-            norm_total = sum(normalized.values())
-
-            # 按归一化后的频率降序排序
-            sorted_items = sorted(normalized.items(), key=lambda x: (-x[1], x[0]))
+            # 按原始频率降序排序
+            sorted_items = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
 
             # 计算数量格式宽度 (与 layout_stats._fmt_count 一致)
             count_width = 1 + int(math.log10(total_count)) if total_count > 0 else 1
@@ -2589,15 +2566,14 @@ class ConditionalProbabilityPanel(BasePanel):
                     txt.insert(tk.END, "\n")
                 for j in range(2):
                     if i + j < len(sorted_items):
-                        pt, norm_cnt = sorted_items[i + j]
+                        pt, cnt = sorted_items[i + j]
                         rank = i + j + 1  # 排名从1开始
-                        original_cnt = counts[pt]
                         if show_pct:
-                            ratio = norm_cnt / norm_total
+                            ratio = cnt / total_count
                             pct_val = ratio * 100
                             val = " 100%" if pct_val == 100 else f"{pct_val:5.1f}%"
                         else:
-                            val = f"{original_cnt:{count_width}d}"
+                            val = f"{cnt:{count_width}d}"
                         seg_text = f"{item_type2string(pt)}:{val}"
                         color = self._rank_color(rank)
                         tag = f"r{i}_{j}"
