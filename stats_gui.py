@@ -37,14 +37,38 @@ EMPTY_TEXT = "(无样本)"
 CAMP_POSITIONS = {(1, 1), (1, 3), (2, 2), (3, 1), (3, 3)}
 
 
-class StatPanel(ttk.Frame):
+class BasePanel(ttk.Frame):
+    """面板基类: 提供行营位置常量和公共方法"""
+
+    CAMP_POSITIONS = CAMP_POSITIONS
+
+    def _is_camp(self, row: int, col: int) -> bool:
+        """判断是否为行营位置"""
+        return (row, col) in self.CAMP_POSITIONS
+
+    def _create_camp_label(self, parent, row: int, col: int, **kwargs) -> tk.Label:
+        """创建行营格子标签"""
+        defaults = {
+            "text": "",
+            "bg": CAMP_BG,
+            "relief": tk.GROOVE,
+            "bd": 1,
+            "height": 6,
+        }
+        defaults.update(kwargs)
+        lbl = tk.Label(parent, **defaults)
+        lbl.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
+        return lbl
+
+
+class StatPanel(BasePanel):
     """独立统计面板基类: 自带统计/导出按钮/汇总栏/6x5 网格与统计结果,
     筛选控件由子类实现 (_build_filter/_get_filter), 多个面板之间互不干扰"""
 
     def __init__(self, parent, folder_var: tk.StringVar, export_name: str,
                  mirror_getter=None, mainline_getter=None, dedup_getter=None,
                  display_mode_getter=None):
-        super().__init__(parent, padding=4)
+        super().__init__(parent, padding=2)
         self._folder_var = folder_var  # 与其它面板共享文件夹输入, 只读
         self._export_name = export_name
         self._mirror_getter = mirror_getter or (lambda: False)  # 行棋习惯: 顺时针时镜像显示
@@ -1902,8 +1926,8 @@ class AdvancedFilterPanel(ttk.Frame):
         self.clear_stats()
 
 
-class ConditionalProbabilityPanel(ttk.Frame):
-    """条件概率筛选面板: 条件格子筛选 + 结果格子显示频率分布"""
+class ConditionalProbabilityPanel(BasePanel):
+    """条件概率筛选面板: 左侧拖拽面板 + 中间条件面板 + 右侧结果面板"""
 
     PIECE_OPTIONS = [
         ("司", ItemType.Silin),
@@ -1920,18 +1944,43 @@ class ConditionalProbabilityPanel(ttk.Frame):
         ("旗", ItemType.Junqi),
     ]
 
-    # 单元格角色: 条件=红色, 结果=绿色, 忽略=黑色
-    CELL_ROLES = {"条件": "#CC0000", "结果": "#00AA00", "忽略": "#000000"}
+    # 归一化因子: 一副完整棋子里每种棋子的个数
+    NORMALIZE_FACTOR = {
+        ItemType.Silin: 1.0,      # 司
+        ItemType.Junzhang: 1.0,   # 军
+        ItemType.Shizhang: 2.0,   # 师
+        ItemType.Lvzhang: 2.0,    # 旅
+        ItemType.Tuanzhang: 2.0,  # 团
+        ItemType.Yinzhang: 2.0,   # 营
+        ItemType.Lianzhang: 3.0,  # 连
+        ItemType.Paizhang: 3.0,   # 排
+        ItemType.Gongbing: 3.0,   # 兵
+        ItemType.Zhadan: 2.0,     # 弹
+        ItemType.Dilei: 3.0,      # 雷
+        ItemType.Junqi: 1.0,      # 旗
+    }
 
     def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar,
                  display_mode_getter=None, direction_getter=None, is_mainline_getter=None):
-        super().__init__(parent, padding=4)
+        super().__init__(parent, padding=2)
         self._folder_var = folder_var
         self._source_var = source_var
         self._display_mode_getter = display_mode_getter or (lambda: "百分比")
         self._direction_getter = direction_getter or (lambda: "逆时针")
         self._is_mainline_getter = is_mainline_getter or (lambda: False)
+        self._selected_piece = None
+        self._stored_result = None  # 存储统计结果用于刷新显示
         self._build_ui()
+
+    def _can_place(self, row: int, piece_name: str) -> bool:
+        """检查棋子是否可以放在指定行"""
+        if piece_name == "弹" and row == 0:
+            return False
+        if piece_name == "雷" and row not in [4, 5]:
+            return False
+        if piece_name == "旗" and row not in [4, 5]:
+            return False
+        return True
 
     def _build_ui(self) -> None:
         # 按钮栏
@@ -1941,142 +1990,219 @@ class ConditionalProbabilityPanel(ttk.Frame):
         self.stat_btn = ttk.Button(button_frame, text="统计", command=self._start_stat)
         self.stat_btn.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.clear_btn = ttk.Button(button_frame, text="清空所有勾选", command=self._clear_all)
+        self.clear_btn = ttk.Button(button_frame, text="清空所有", command=self._clear_all)
         self.clear_btn.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.result_var = tk.StringVar(value="选择条件/结果格子后点击统计")
+        self.result_var = tk.StringVar(value="点击棋子后，左键单击放置在指定位置，右键单击取消")
         ttk.Label(button_frame, textvariable=self.result_var).pack(side=tk.LEFT, padx=(20, 0))
 
-        # 网格区域
-        grid_frame = ttk.Frame(self)
-        grid_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # 子类可覆写的高度变量
+        self._cond_cell_height = 90  # 条件面板单元格高度(像素)
+        self._result_cell_height = 6  # 结果面板单元格高度(字符行数)
 
-        # 存储
-        self.cell_role_vars = {}     # {(row, col): tk.StringVar}
-        self.checkbox_vars = {}      # {(row, col, piece_name): tk.BooleanVar}
-        self.cell_cb_frames = {}     # {(row, col): ttk.Frame} 棋子复选框容器
-        self.cell_result_labels = {} # {(row, col): ttk.Label} 结果显示标签
-        self.cell_frames = {}        # {(row, col): ttk.LabelFrame} 格子容器
-        self.cell_role_frames = {}   # {(row, col): ttk.Frame} 角色选择容器
-        self.flag_label = None       # 旗侧视角下(5,1)的旗标签
+        # 主容器: 左侧(棋子+条件) + 右侧(结果)
+        main_frame = ttk.Frame(self)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        main_frame.columnconfigure(0, weight=0)  # 左侧固定宽度
+        main_frame.columnconfigure(1, weight=0)  # 结果面板固定宽度
+        main_frame.rowconfigure(0, weight=1)
+
+        # ===== 左侧: 棋子 + 条件面板垂直排列 =====
+        left_frame = ttk.Frame(main_frame)
+        left_frame.grid(row=0, column=0, padx=(0, 5), sticky="nsew")
+        left_frame.rowconfigure(0, weight=0)  # 棋子栏不拉伸
+        left_frame.rowconfigure(1, weight=1)  # 条件面板拉伸
+        left_frame.columnconfigure(0, weight=1)
+
+        # ----- 棋子栏 (2x6) -----
+        drag_frame = ttk.LabelFrame(left_frame, text="棋子")
+        drag_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 5))
+
+        self._drag_labels = {}  # {piece_name: tk.Label}
+        for idx, (piece_name, piece_type) in enumerate(self.PIECE_OPTIONS):
+            r, c = divmod(idx, 6)  # 2行6列
+            lbl = tk.Label(drag_frame, text=piece_name, width=4, height=1,
+                          font=("Consolas", 10, "bold"), relief=tk.RAISED, bd=1,
+                          bg="#E8E8E8", cursor="hand2")
+            lbl.grid(row=r, column=c, padx=3, pady=3, sticky="nsew")
+            lbl.bind("<Button-1>", lambda e, pn=piece_name: self._on_drag_click(pn))
+            self._drag_labels[piece_name] = lbl
+
+        for c in range(6):
+            drag_frame.columnconfigure(c, weight=1)
+
+        # ----- 条件面板 (6x5) -----
+        cond_frame = ttk.LabelFrame(left_frame, text="条件面板(放置棋子=条件, 空格子=结果)")
+        cond_frame.grid(row=1, column=0, sticky="nsew")
+
+        self.cell_pieces = {}  # {(row,col): set(piece_name)}
+        self.cell_labels = {}  # {(row,col): {piece_name: tk.Label}}
+        self.cond_cells = {}   # {(row,col): tk.Frame}
 
         for row in range(6):
             for col in range(5):
-                if (row, col) in CAMP_POSITIONS:
-                    ttk.Label(grid_frame, text="(行营)", anchor=tk.CENTER).grid(
-                        row=row, column=col, padx=2, pady=2, sticky="nsew")
+                if self._is_camp(row, col):
+                    self._create_camp_label(cond_frame, row, col)
                     continue
 
-                cell_frame = ttk.LabelFrame(grid_frame, text=f"({row+1},{col+1})")
-                cell_frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
-                self.cell_frames[(row, col)] = cell_frame
+                cell = tk.Frame(cond_frame, relief=tk.GROOVE, bd=1, bg="#FFFFFF",
+                               width=81, height=self._cond_cell_height)
+                cell.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
+                cell.grid_propagate(False)
+                self.cond_cells[(row, col)] = cell
+                self.cell_pieces[(row, col)] = set()
+                self.cell_labels[(row, col)] = {}
 
-                # 角色三选一: 条件/结果/忽略
-                role_var = tk.StringVar(value="忽略")
-                self.cell_role_vars[(row, col)] = role_var
-                role_frame = ttk.Frame(cell_frame)
-                role_frame.pack(fill=tk.X, padx=2, pady=(2, 0))
-                self.cell_role_frames[(row, col)] = role_frame
-                for role_name in ("条件", "结果", "忽略"):
-                    ttk.Radiobutton(role_frame, text=role_name, value=role_name,
-                                    variable=role_var,
-                                    command=lambda r=row, c=col: self._on_role_change(r, c)
-                                    ).pack(side=tk.LEFT, padx=(0, 4))
+                cell.bind("<Button-1>", lambda e, r=row, c=col: self._on_cell_click(r, c))
+                cell.bind("<Button-3>", lambda e, r=row, c=col: self._on_cell_right_click(r, c))
 
-                # 棋子复选框 4行3列 (默认隐藏)
-                cb_frame = ttk.Frame(cell_frame)
-                self.cell_cb_frames[(row, col)] = cb_frame
-                for idx, (piece_name, piece_type) in enumerate(self.PIECE_OPTIONS):
-                    r, c = divmod(idx, 3)
-                    var = tk.BooleanVar(value=False)
-                    self.checkbox_vars[(row, col, piece_name)] = var
+                # 统一4行3列布局
+                for pr in range(4):
+                    for pc in range(3):
+                        piece_idx = pr * 3 + pc
+                        if piece_idx < len(self.PIECE_OPTIONS):
+                            pn = self.PIECE_OPTIONS[piece_idx][0]
+                            if not self._can_place(row, pn):
+                                continue
+                            plbl = tk.Label(cell, text="", width=3, height=1,
+                                           font=("Consolas", 10), bg="#FFFFFF")
+                            plbl.grid(row=pr, column=pc, padx=0, pady=0, sticky="nsew")
+                            plbl.bind("<Button-1>",
+                                     lambda e, r=row, c=col: self._on_cell_click(r, c))
+                            plbl.bind("<Button-3>",
+                                     lambda e, r=row, c=col, pn=pn: self._on_piece_remove(r, c, pn))
+                            self.cell_labels[(row, col)][pn] = plbl
+                        else:
+                            tk.Label(cell, text="", width=3, height=1,
+                                    bg="#FFFFFF").grid(row=pr, column=pc, padx=0, pady=0, sticky="nsew")
 
-                    should_disable = False
-                    if piece_name == "弹" and row == 0:
-                        should_disable = True
-                    if piece_name == "旗" and (row, col) not in [(5, 1), (5, 3)]:
-                        should_disable = True
-                    if piece_name == "雷" and row not in [4, 5]:
-                        should_disable = True
+        # 使用 uniform 确保所有行高一致、所有列宽一致
+        for row in range(6):
+            cond_frame.rowconfigure(row, weight=1, uniform="cond_row")
+        for col in range(5):
+            cond_frame.columnconfigure(col, weight=1, uniform="cond_col")
 
-                    state = tk.DISABLED if should_disable else tk.NORMAL
-                    ttk.Checkbutton(cb_frame, text=piece_name, variable=var,
-                                    state=state).grid(row=r, column=c, padx=2, pady=1, sticky=tk.W)
+        # ===== 右侧: 结果面板 (6x5) =====
+        result_frame = ttk.LabelFrame(main_frame, text="结果面板")
+        result_frame.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
 
-                # 结果显示标签 (默认隐藏)
-                result_lbl = ttk.Label(cell_frame, text="", foreground="#00AA00",
-                                       font=("Consolas", 9), anchor=tk.NW, justify=tk.LEFT)
-                self.cell_result_labels[(row, col)] = result_lbl
+        self.cell_result_labels = {}
 
-                # 默认忽略: 隐藏棋子框和结果标签
-                # (pack_forget 不需要调用，因为还没 pack)
+        # 结果面板: 固定宽度21字符
+        for c in range(5):
+            result_frame.columnconfigure(c, weight=0, uniform="result_col")
 
         for row in range(6):
-            grid_frame.rowconfigure(row, weight=1)
-        for col in range(5):
-            grid_frame.columnconfigure(col, weight=1)
+            for col in range(5):
+                if self._is_camp(row, col):
+                    self._create_camp_label(result_frame, row, col, width=21, height=self._result_cell_height)
+                    continue
 
-    def _on_role_change(self, row: int, col: int) -> None:
-        """格子角色切换时，显示/隐藏对应内容"""
-        role = self.cell_role_vars[(row, col)].get()
-        cb_frame = self.cell_cb_frames[(row, col)]
-        result_lbl = self.cell_result_labels[(row, col)]
+                result_lbl = tk.Label(result_frame, text="", bg="#FFFFFF",
+                                      relief=tk.GROOVE, bd=1, font=("Consolas", 10),
+                                      anchor=tk.NW, justify=tk.LEFT, height=self._result_cell_height, width=21)
+                result_lbl.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
+                self.cell_result_labels[(row, col)] = result_lbl
 
-        # 先全部隐藏
-        cb_frame.pack_forget()
-        result_lbl.pack_forget()
+        for row in range(6):
+            result_frame.rowconfigure(row, weight=1, uniform="result_row")
 
-        if role == "条件":
-            cb_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
-        elif role == "结果":
-            result_lbl.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
+    def _on_drag_click(self, piece_name: str) -> None:
+        """点击拖拽面板的棋子: RadioButton行为, 同时只能选中一个"""
+        if self._selected_piece == piece_name:
+            # 取消选中
+            self._selected_piece = None
+            self._drag_labels[piece_name].config(bg="#E8E8E8", relief=tk.RAISED)
+            self.result_var.set("点击棋子后，左键单击放置在指定位置，右键单击取消")
+        else:
+            # 取消之前的选中
+            if self._selected_piece:
+                self._drag_labels[self._selected_piece].config(bg="#E8E8E8", relief=tk.RAISED)
+            # 选中新的
+            self._selected_piece = piece_name
+            self._drag_labels[piece_name].config(bg="#90EE90", relief=tk.SUNKEN)
+            self.result_var.set(f"已选中: {piece_name}，左键放置，右键取消")
+
+    def _on_cell_click(self, row: int, col: int) -> None:
+        """左键点击条件面板格子: 放置选中的棋子"""
+        if not self._selected_piece:
+            return
+        piece_name = self._selected_piece
+
+        if not self._can_place(row, piece_name):
+            messagebox.showwarning("提示", f"{piece_name} 不能放在第 {row+1} 行")
+            return
+
+        if piece_name in self.cell_pieces[(row, col)]:
+            return
+
+        self.cell_pieces[(row, col)].add(piece_name)
+        if piece_name in self.cell_labels[(row, col)]:
+            self.cell_labels[(row, col)][piece_name].config(text=piece_name, bg="#90EE90")
+
+    def _on_cell_right_click(self, row: int, col: int) -> None:
+        """右键点击条件面板格子: 移除最后放置的棋子"""
+        if self.cell_pieces[(row, col)]:
+            # 移除最后添加的棋子
+            last_piece = list(self.cell_pieces[(row, col)])[-1]
+            self.cell_pieces[(row, col)].discard(last_piece)
+            if last_piece in self.cell_labels[(row, col)]:
+                self.cell_labels[(row, col)][last_piece].config(text="", bg="#FFFFFF")
+
+    def _on_piece_remove(self, row: int, col: int, piece_name: str) -> None:
+        """点击条件面板格子里的棋子: 移除"""
+        if piece_name in self.cell_pieces[(row, col)]:
+            self.cell_pieces[(row, col)].discard(piece_name)
+            if piece_name in self.cell_labels[(row, col)]:
+                self.cell_labels[(row, col)][piece_name].config(text="", bg="#FFFFFF")
 
     def update_for_direction(self) -> None:
-        """根据方向模式更新格子显示状态
-        旗侧视角下(5,1)位置显示旗、灰色、隐藏radiobutton"""
+        """根据方向模式更新格子显示状态"""
         is_mainline = self._is_mainline_getter()
         target = (5, 1)
 
-        if target not in self.cell_frames:
+        if target not in self.cond_cells:
             return
 
-        cell_frame = self.cell_frames[target]
-        role_frame = self.cell_role_frames[target]
-        role_var = self.cell_role_vars[target]
-        cb_frame = self.cell_cb_frames[target]
-        result_lbl = self.cell_result_labels[target]
-
+        cell = self.cond_cells[target]
         if is_mainline:
-            # 旗侧视角: (5,1) 显示旗、灰色、隐藏所有交互
-            role_var.set("忽略")
-            cb_frame.pack_forget()
-            result_lbl.pack_forget()
-            role_frame.pack_forget()
-            if self.flag_label is None:
-                self.flag_label = ttk.Label(cell_frame, text="旗", anchor=tk.CENTER,
-                                            font=("", 14, "bold"))
-            self.flag_label.pack(fill=tk.BOTH, expand=True)
-            cell_frame.config(text="(6,2) 旗侧")
+            for child in cell.winfo_children():
+                child.grid_forget()
+            lbl = tk.Label(cell, text="旗", bg="#C0C0C0", font=("Consolas", 10, "bold"))
+            lbl.pack(fill=tk.BOTH, expand=True)
+            self.cell_pieces[target].clear()
         else:
-            # 其它方向: 恢复正常显示
-            if self.flag_label is not None:
-                self.flag_label.pack_forget()
-            role_frame.pack(fill=tk.X, padx=2, pady=(2, 0))
-            cell_frame.config(text=f"(6,2)")
-            # 恢复当前角色的显示
-            self._on_role_change(5, 1)
+            for child in cell.winfo_children():
+                child.destroy()
+            self.cell_pieces[target].clear()
+            self.cell_labels[target] = {}
+            grid_rows = 4
+            for pr in range(grid_rows):
+                for pc in range(3):
+                    piece_idx = pr * 3 + pc
+                    if piece_idx < len(self.PIECE_OPTIONS):
+                        pn = self.PIECE_OPTIONS[piece_idx][0]
+                        if not self._can_place(target[0], pn):
+                            continue
+                        plbl = tk.Label(cell, text="", width=3, height=1,
+                                       font=("Consolas", 10), bg="#FFFFFF")
+                        plbl.grid(row=pr, column=pc, padx=1, pady=1)
+                        plbl.bind("<Button-1>",
+                                 lambda e, r=target[0], c=target[1], pn=pn: self._on_piece_remove(r, c, pn))
+                        self.cell_labels[target][pn] = plbl
 
     def _clear_all(self) -> None:
-        """清空所有角色和棋子勾选，复位为忽略"""
-        for (row, col), role_var in self.cell_role_vars.items():
-            role_var.set("忽略")
-            # 隐藏棋子框和结果标签
-            self.cell_cb_frames[(row, col)].pack_forget()
-            self.cell_result_labels[(row, col)].pack_forget()
-            self.cell_result_labels[(row, col)].config(text="")
-        for var in self.checkbox_vars.values():
-            var.set(False)
-        self.result_var.set("选择条件/结果格子后点击统计")
+        """清空条件面板和结果面板"""
+        for (row, col), pieces in self.cell_pieces.items():
+            pieces.clear()
+            for pn, lbl in self.cell_labels[(row, col)].items():
+                lbl.config(text="", bg="#FFFFFF")
+        for (row, col), lbl in self.cell_result_labels.items():
+            lbl.config(text="")
+        if self._selected_piece:
+            self._drag_labels[self._selected_piece].config(bg="#E8E8E8", relief=tk.RAISED)
+            self._selected_piece = None
+        self.result_var.set("点击棋子后，左键单击放置在指定位置，右键单击取消")
 
     @staticmethod
     def _mirror_col(col: int) -> int:
@@ -2128,29 +2254,33 @@ class ConditionalProbabilityPanel(ttk.Frame):
             messagebox.showwarning("提示", "请先选择有效的文件夹")
             return
 
-        # 收集条件格子 (显示坐标)
+        # 清空上次统计结果
+        self._stored_result = None
+        self._clear_result_labels()
+
+        # 收集条件格子
         conditions = {}
-        result_cells = set()
         PIECE_NAME_TO_TYPE = {name: pt for name, pt in self.PIECE_OPTIONS}
 
-        for (row, col), role_var in self.cell_role_vars.items():
-            role = role_var.get()
-            if role == "条件":
+        for (row, col), pieces in self.cell_pieces.items():
+            if pieces:
                 checked = set()
-                for (r, c, pname), var in self.checkbox_vars.items():
-                    if r == row and c == col and var.get():
-                        checked.add(PIECE_NAME_TO_TYPE[pname])
-                if checked:
-                    conditions[(row, col)] = checked
-            elif role == "结果":
-                result_cells.add((row, col))
+                for pn in pieces:
+                    checked.add(PIECE_NAME_TO_TYPE[pn])
+                conditions[(row, col)] = checked
 
         if not conditions:
-            messagebox.showwarning("提示", "请至少将一个格子设为'条件'并勾选棋子")
+            messagebox.showwarning("提示", "请在条件面板中放置至少一个棋子")
             return
-        if not result_cells:
-            messagebox.showwarning("提示", "请至少将一个格子设为'结果'")
-            return
+
+        # 结果格子 = 所有非条件、非行营格子
+        result_cells = set()
+        for row in range(6):
+            for col in range(5):
+                if (row, col) in CAMP_POSITIONS:
+                    continue
+                if (row, col) not in conditions:
+                    result_cells.add((row, col))
 
         self.stat_btn.config(state=tk.DISABLED)
         self.result_var.set("统计中……")
@@ -2272,22 +2402,42 @@ class ConditionalProbabilityPanel(ttk.Frame):
             self.result_var.set(f"无匹配布阵 (总文件: {total})")
             return
 
-        # 在结果格子里显示频率分布 (每行两个棋子)
+        # 存储统计结果，用于切换显示模式时刷新
+        self._stored_result = (result_counts, match_total, total)
+
+        # 渲染结果
+        self._render_results(result_counts, match_total, total, show_pct)
+
+    def _render_results(self, result_counts, match_total, total, show_pct):
+        """渲染统计结果到结果面板"""
         from src.jgs_types import item_type2string
         for rc, counts in result_counts.items():
             total_count = sum(counts.values())
             if total_count == 0:
                 continue
-            sorted_items = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+
+            # 归一化: 仅用于排序和百分比计算
+            normalized = {}
+            for pt, cnt in counts.items():
+                factor = self.NORMALIZE_FACTOR.get(pt, 1.0)
+                normalized[pt] = cnt / factor
+            norm_total = sum(normalized.values())
+
+            # 按归一化后的频率降序排序
+            sorted_items = sorted(normalized.items(), key=lambda x: (-x[1], x[0]))
             # 每行两个棋子
             lines = []
             for i in range(0, len(sorted_items), 2):
                 parts = []
                 for j in range(2):
                     if i + j < len(sorted_items):
-                        pt, cnt = sorted_items[i + j]
-                        ratio = cnt / total_count
-                        val = f"{ratio*100:5.1f}%" if show_pct else str(cnt)
+                        pt, norm_cnt = sorted_items[i + j]
+                        original_cnt = counts[pt]  # 原始出现次数
+                        if show_pct:
+                            ratio = norm_cnt / norm_total
+                            val = f"{ratio*100:5.1f}%"
+                        else:
+                            val = str(original_cnt)  # 数量模式显示原始整数
                         parts.append(f"{item_type2string(pt)}:{val}")
                 lines.append("  ".join(parts))
             # 更新结果标签
@@ -2299,23 +2449,33 @@ class ConditionalProbabilityPanel(ttk.Frame):
 
     def clear_stats(self) -> None:
         """清空统计结果"""
+        self._stored_result = None
         self._clear_all()
 
     def _refresh_grid(self) -> None:
-        """方向变化时清空结果（结果与镜像设置绑定）"""
-        self._clear_result_labels()
+        """方向变化或显示模式变化时刷新结果"""
+        if self._stored_result:
+            # 有存储的统计结果，重新渲染
+            result_counts, match_total, total = self._stored_result
+            show_pct = self._display_mode_getter() == "百分比"
+            self._render_results(result_counts, match_total, total, show_pct)
+        else:
+            self._clear_result_labels()
 
     def _clear_result_labels(self) -> None:
         """清空所有结果标签内容"""
         for rc, lbl in self.cell_result_labels.items():
             lbl.config(text="")
-        self.result_var.set("选择条件/结果格子后点击统计")
+        self.result_var.set("点击棋子后，左键单击放置在指定位置，右键单击取消")
 
 
 class StatsGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("军棋复盘布阵统计")
+
+        # 设置窗口默认大小 (宽度994, 高度812 = 933 - 121灰边)
+        self.root.geometry("1230x812")
 
         self._build_folder_bar()
         self._build_tabs()
@@ -2354,9 +2514,10 @@ class StatsGUI:
             ttk.Radiobutton(row2, text=name, value=name, variable=self.direction_var,
                             command=self._on_direction_change).pack(side=tk.LEFT, padx=(4, 0))
 
-        # 去重勾选框
-        self.dedup_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row2, text="去除重复布阵", variable=self.dedup_var).pack(side=tk.LEFT, padx=(16, 0))
+        # 去重勾选框 (默认开启)
+        self.dedup_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row2, text="去除重复布阵", variable=self.dedup_var,
+                        command=self._on_dedup_change).pack(side=tk.LEFT, padx=(16, 0))
 
         # 频率显示模式: 百分比/数量
         ttk.Label(row2, text="  显示:").pack(side=tk.LEFT)
@@ -2383,10 +2544,10 @@ class StatsGUI:
         return self.direction_var.get() == "顺时针"
 
     def _on_source_change(self) -> None:
-        """切换联众/QQ模式, 保持选项卡对应位置"""
+        """切换联众/QQ模式"""
         is_lianzhong = self.source_var.get() == "联众"
 
-        # 记住当前选中的tab
+        # 记住当前选中的tab索引
         current_idx = self.notebook.index(self.notebook.select())
 
         # 切换默认方向: 如果当前是主线模式则保留, 否则设默认
@@ -2396,6 +2557,7 @@ class StatsGUI:
             else:
                 self.direction_var.set("逆时针")
 
+        # 显示/隐藏平台专属tabs
         # QQ专属 tabs (index 1, 3)
         for i in (1, 3):
             self.notebook.tab(i, state="hidden" if is_lianzhong else "normal")
@@ -2404,15 +2566,28 @@ class StatsGUI:
         # 联众专属 tabs (index 4, 5, 6)
         for i in (4, 5, 6):
             self.notebook.tab(i, state="normal" if is_lianzhong else "hidden")
+        # 高级筛选 tab (index 7) 始终隐藏
+        self.notebook.tab(7, state="hidden")
         # 公共 tabs 始终显示
-        for i in (0, 7, 8):
+        for i in (0, 8):
             self.notebook.tab(i, state="normal")
 
-        # 根据映射关系选择对应的tab
-        if is_lianzhong:
-            target_idx = self._qq_to_lz_tab.get(current_idx, 4)
+        # 选项卡跳转逻辑:
+        # 1.1 QQ->联众，且当前是"QQ颜色(兼座次)统计"(index=1) -> 切换到"颜色统计"(index=4)
+        # 1.2 联众->QQ，且当前是"颜色统计"(index=4)或"先手方视角"(index=5) -> 切换到"QQ颜色(兼座次)统计"(index=1)
+        # 其它情况不跳变
+        if is_lianzhong and current_idx == 1:
+            target_idx = 4
+        elif not is_lianzhong and current_idx in (4, 5):
+            target_idx = 1
         else:
-            target_idx = self._lz_to_qq_tab.get(current_idx, 1)
+            # 尝试保持当前索引，如果不可见则跳到0
+            target_idx = current_idx
+            try:
+                self.notebook.tab(target_idx, state="normal")
+            except Exception:
+                target_idx = 0
+
         # 确保目标tab可见
         try:
             self.notebook.select(target_idx)
@@ -2445,9 +2620,13 @@ class StatsGUI:
                      self.advanced_filter_panel, self.conditional_panel):
             panel._refresh_grid()
 
+    def _on_dedup_change(self) -> None:
+        """切换去除重复布阵选项"""
+        self._clear_all_stats()
+
     def _build_tabs(self) -> None:
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 2))
 
         dedup_getter = lambda: self.dedup_var.get()
         display_mode_getter = lambda: self.display_mode_var.get()
@@ -2507,12 +2686,13 @@ class StatsGUI:
         self.notebook.add(self.lz_id_panel, text="联众ID统计")
         self.notebook.tab(6, state="hidden")
 
-        # 高级筛选 (index=7, 始终显示)
+        # 高级筛选 (index=7, 始终隐藏)
         self.advanced_filter_panel = AdvancedFilterPanel(
             self.notebook, self.folder_var, self.source_var,
             direction_getter=lambda: self.direction_var.get(),
             is_mainline_getter=self._is_mainline)
         self.notebook.add(self.advanced_filter_panel, text="高级筛选")
+        self.notebook.tab(7, state="hidden")
 
         # 条件概率筛选 (index=8, 始终显示)
         self.conditional_panel = ConditionalProbabilityPanel(
