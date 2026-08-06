@@ -2575,16 +2575,25 @@ class StatsGUI:
         # 选项卡跳转逻辑:
         # 1.1 QQ->联众，且当前是"QQ颜色(兼座次)统计"(index=1) -> 切换到"颜色统计"(index=4)
         # 1.2 联众->QQ，且当前是"颜色统计"(index=4)或"先手方视角"(index=5) -> 切换到"QQ颜色(兼座次)统计"(index=1)
-        # 其它情况不跳变
+        # 1.3 QQ->联众，且当前是"QQ号码统计"(index=3) -> 切换到"联众ID统计"(index=6)
+        # 1.4 联众->QQ，且当前是"联众ID统计"(index=6) -> 切换到"QQ号码统计"(index=3)
+        # 其它情况: 如果当前tab被隐藏，跳到棋子维度统计(0)
         if is_lianzhong and current_idx == 1:
             target_idx = 4
+        elif is_lianzhong and current_idx == 3:
+            target_idx = 6
         elif not is_lianzhong and current_idx in (4, 5):
             target_idx = 1
+        elif not is_lianzhong and current_idx == 6:
+            target_idx = 3
         else:
-            # 尝试保持当前索引，如果不可见则跳到0
-            target_idx = current_idx
+            # 检查当前tab是否仍然可见
             try:
-                self.notebook.tab(target_idx, state="normal")
+                tab_state = self.notebook.tab(current_idx, "state")
+                if tab_state == "hidden":
+                    target_idx = 0  # 跳到棋子维度统计
+                else:
+                    target_idx = current_idx
             except Exception:
                 target_idx = 0
 
