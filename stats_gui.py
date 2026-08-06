@@ -51,6 +51,13 @@ class BasePanel(ttk.Frame):
         """判断是否为行营位置"""
         return (row, col) in self.CAMP_POSITIONS
 
+    def _layout_to_key(self, layout_data) -> tuple:
+        """将布阵转换为可哈希的元组用于去重"""
+        if isinstance(layout_data, JGSLayoutBlock):
+            return tuple(layout_data.item(r, c) for r in range(6) for c in range(5))
+        else:
+            return tuple(layout_data[r][c] for r in range(6) for c in range(5))
+
     def _create_camp_label(self, parent, row: int, col: int, **kwargs) -> tk.Label:
         """创建行营格子标签"""
         defaults = {
@@ -531,9 +538,11 @@ class QQPanel(StatPanel):
         self.matched_layouts = matched
         self._refresh_grid()
         failed = len(stats.failed_files)
+        # 计算去重后的复盘文件数
+        unique_replay_files = len(set(fp for fp, _, _ in matched)) if matched else 0
         summary = (f"筛选: {self._filter_desc}    找到文件: {total_files}    "
                    f"解析成功: {stats.file_count}    失败: {failed}    "
-                   f"统计布阵数: {stats.layout_count}")
+                   f"统计布阵数: {stats.layout_count}    去重复盘数: {unique_replay_files}")
         self.summary_var.set(summary)
         self.export_btn.config(state=tk.NORMAL if matched else tk.DISABLED)
         self.export_replay_btn.config(state=tk.NORMAL if matched else tk.DISABLED)
@@ -556,8 +565,6 @@ class QQPanel(StatPanel):
             return
 
         try:
-            total_count = len(self.matched_layouts)
-            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
             is_jqs = self.export_format_var.get() == "联众(jqs)"
 
             # JQS格式常量
@@ -591,8 +598,20 @@ class QQPanel(StatPanel):
             JQL_LAYOUT_OFFSET = 0x14
             JQL_FILE_SIZE = 50
 
+            # 按布阵内容去重
+            seen_layouts = set()
+            unique_layouts = []
+            for file_path, color, layout_data in self.matched_layouts:
+                key = self._layout_to_key(layout_data)
+                if key not in seen_layouts:
+                    seen_layouts.add(key)
+                    unique_layouts.append((file_path, color, layout_data))
+
+            total_count = len(unique_layouts)
+            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
+
             exported_count = 0
-            for i, (file_path, color, layout_data) in enumerate(self.matched_layouts):
+            for i, (file_path, color, layout_data) in enumerate(unique_layouts):
                 original_name = Path(file_path).stem
                 ext = ".jqs" if is_jqs else ".jql"
                 new_filename = f"{i:0{prefix_digits}d}_{original_name}{ext}"
@@ -897,9 +916,11 @@ class LianzhongIDPanel(StatPanel):
         self.matched_layouts = matched
         self._refresh_grid()
         failed = len(stats.failed_files)
+        # 计算去重后的复盘文件数
+        unique_replay_files = len(set(fp for fp, _, _ in matched)) if matched else 0
         summary = (f"筛选: {self._filter_desc}    找到文件: {total_files}    "
                    f"解析成功: {stats.file_count}    失败: {failed}    "
-                   f"统计布阵数: {stats.layout_count}")
+                   f"统计布阵数: {stats.layout_count}    去重复盘数: {unique_replay_files}")
         self.summary_var.set(summary)
         self.export_btn.config(state=tk.NORMAL if matched else tk.DISABLED)
         self.export_replay_btn.config(state=tk.NORMAL if matched else tk.DISABLED)
@@ -919,8 +940,6 @@ class LianzhongIDPanel(StatPanel):
         if not save_dir:
             return
         try:
-            total_count = len(self.matched_layouts)
-            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
             is_jqs = self.export_format_var.get() == "联众(jqs)"
             JQS_HEADER = bytes([
                 0x47, 0x4C, 0xE9, 0x03, 0xCE, 0x07, 0xC4, 0x02, 0x53, 0x61, 0x74, 0x20,
@@ -957,8 +976,21 @@ class LianzhongIDPanel(StatPanel):
                 ItemType.Zhadan: 0x0C,
             }
             PIECE_TO_EXPORT = PIECE_TO_JQS if is_jqs else PIECE_TO_JQL
+
+            # 按布阵内容去重
+            seen_layouts = set()
+            unique_layouts = []
+            for file_path, color, layout_data in self.matched_layouts:
+                key = self._layout_to_key(layout_data)
+                if key not in seen_layouts:
+                    seen_layouts.add(key)
+                    unique_layouts.append((file_path, color, layout_data))
+
+            total_count = len(unique_layouts)
+            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
+
             exported_count = 0
-            for i, (file_path, color, layout_data) in enumerate(self.matched_layouts):
+            for i, (file_path, color, layout_data) in enumerate(unique_layouts):
                 original_name = Path(file_path).stem
                 ext = ".jqs" if is_jqs else ".jql"
                 new_filename = f"{i:0{prefix_digits}d}_{original_name}{ext}"
@@ -2716,11 +2748,11 @@ class ConditionalProbabilityPanel(BasePanel):
             JQL_FILE_SIZE = 50
             PIECE_TO_JQL = PIECE_TO_JQS
 
-            # 按布阵去重
+            # 按布阵内容去重
             seen_keys = set()
             unique_layouts = []
             for file_path, color, layout_data in self._matched_layouts:
-                key = (id(layout_data) if isinstance(layout_data, JGSLayoutBlock) else str(layout_data))
+                key = self._layout_to_key(layout_data)
                 if key not in seen_keys:
                     seen_keys.add(key)
                     unique_layouts.append((file_path, color, layout_data))
