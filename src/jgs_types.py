@@ -41,7 +41,7 @@ if ItemTypeStringShort:
         ItemType.JQNone: "○○",
         ItemType.Junqi: "旗",
         ItemType.Dilei: "雷",
-        ItemType.Zhadan: "炸",
+        ItemType.Zhadan: "弹",
         ItemType.Silin: "司",
         ItemType.Junzhang: "军",
         ItemType.Shizhang: "师",
