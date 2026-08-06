@@ -2282,8 +2282,11 @@ class ConditionalProbabilityPanel(BasePanel):
 
         cell = self.cond_cells[target]
         if is_mainline:
+            # 先销毁所有子控件
             for child in cell.winfo_children():
-                child.grid_forget()
+                child.destroy()
+            self.cell_labels[target] = {}
+            # 创建旗标签
             lbl = tk.Label(cell, text="旗", bg="#C0C0C0", font=("Consolas", 10, "bold"))
             lbl.pack(fill=tk.BOTH, expand=True)
             self.cell_pieces[target].clear()
