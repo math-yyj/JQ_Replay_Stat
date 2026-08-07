@@ -155,6 +155,44 @@ def decode_jqh_all_usernames(raw: bytes) -> list[str]:
     return names
 
 
+# ============================================================
+# 联众 .JQH 主视角颜色解码
+# ============================================================
+# 编码公式: ((data[0xB7] + 主视角颜色) % 0x100) ^ 0x13 = data[0xB8]
+# 解码公式: 主视角颜色 = ((data[0xB8] ^ 0x13) - data[0xB7]) % 0x100
+# 颜色映射: 红=0, 绿=1, 蓝=2, 黑=3
+
+JQH_MAIN_COLOR_OFFSET_PREV = 0xB7   # 前一个编码字节
+JQH_MAIN_COLOR_OFFSET_CURR = 0xB8   # 当前编码字节
+JQH_MAIN_COLOR_XOR_KEY = 0x13       # XOR密钥
+
+# 主视角颜色索引 -> 名称
+JQH_MAIN_COLOR_MAP = {0: "红", 1: "绿", 2: "蓝", 3: "黑"}
+
+
+def decode_jqh_main_color(raw: bytes) -> tuple[int, str]:
+    """解码联众复盘的主视角颜色
+
+    编码公式: ((data[0xB7] + color) % 0x100) ^ 0x13 = data[0xB8]
+    解码公式: color = ((data[0xB8] ^ 0x13) - data[0xB7]) % 0x100
+
+    Returns:
+        (color_index, color_name)  color_index: 0=红, 1=绿, 2=蓝, 3=黑
+    """
+    if len(raw) < JQH_MAIN_COLOR_OFFSET_CURR + 1:
+        return -1, "数据不足"
+
+    encoded = raw[JQH_MAIN_COLOR_OFFSET_CURR]
+    prev = raw[JQH_MAIN_COLOR_OFFSET_PREV]
+
+    color = ((encoded ^ JQH_MAIN_COLOR_XOR_KEY) - prev) % 0x100
+
+    if color in JQH_MAIN_COLOR_MAP:
+        return color, JQH_MAIN_COLOR_MAP[color]
+    else:
+        return color, f"未知({color})"
+
+
 def parse_jqs_layout(data: bytes, offset: int = JQS_LAYOUT_OFFSET) -> list[list[str]]:
     """解析联众 .jqs 单家布阵, 返回 6x5 的棋子字符矩阵(行主序, '空'=行营)。
 
