@@ -58,6 +58,29 @@ class BasePanel(ttk.Frame):
         else:
             return tuple(layout_data[r][c] for r in range(6) for c in range(5))
 
+    def _layout_has_invalid_piece(self, layout_data) -> str | None:
+        """检查布阵非行营位置是否含空位/非法棋子/缺少军旗
+        
+        Returns:
+            错误信息字符串，合法返回 None
+        """
+        has_flag = False
+        for row in range(6):
+            for col in range(5):
+                if (row, col) in self.CAMP_POSITIONS:
+                    continue
+                if isinstance(layout_data, JGSLayoutBlock):
+                    item = layout_data.item(row, col)
+                else:
+                    item = layout_data[row][col]
+                if item == ItemType.JQNone:
+                    return f"位置({row},{col})为空"
+                if item == ItemType.Junqi:
+                    has_flag = True
+        if not has_flag:
+            return "布阵缺少军旗"
+        return None
+
     def _create_camp_label(self, parent, row: int, col: int, **kwargs) -> tk.Label:
         """创建行营格子标签"""
         defaults = {
@@ -497,6 +520,16 @@ class QQPanel(StatPanel):
                 for i, jgs_file in enumerate(files):
                     try:
                         total_info = load_total_info(jgs_file)
+                        # 检查是否有非法棋子
+                        skip = False
+                        for pib in total_info.player_info_block:
+                            err = self._layout_has_invalid_piece(pib.player_layout)
+                            if err:
+                                stats._skipped_abnormal_files.append((jgs_file, err))
+                                skip = True
+                                break
+                        if skip:
+                            continue
                         self_color = total_info.header_block.self_color
                         for pib in total_info.player_info_block:
                             if _layout_is_empty(pib.player_layout):
@@ -872,6 +905,27 @@ class LianzhongIDPanel(StatPanel):
                         raw = open(jqh_file, "rb").read()
                         boards, _ = decode_jqh_all_boards(raw)
                         usernames = decode_jqh_all_usernames(raw)
+                        # 检查是否有非法棋子(非行营位置为空)
+                        skip = False
+                        for color in ALL_COLORS:
+                            board = boards.get(color)
+                            if board is None:
+                                continue
+                            for row in range(6):
+                                for col in range(5):
+                                    if (row, col) in self.CAMP_POSITIONS:
+                                        continue
+                                    ch = board[row][col] if row < len(board) and col < len(board[row]) else "空"
+                                    if ch == "空":
+                                        stats._skipped_abnormal_files.append((jqh_file, f"{color}方位置({row},{col})为空"))
+                                        skip = True
+                                        break
+                                if skip:
+                                    break
+                            if skip:
+                                break
+                        if skip:
+                            continue
                         for color_idx, color in enumerate(ALL_COLORS):
                             board = boards.get(color)
                             if board is None:
@@ -2243,6 +2297,15 @@ class LayoutFilterPanel(BasePanel):
                 for jgs_file in jgs_files:
                     try:
                         total_info = load_total_info(jgs_file)
+                        # 检查是否有非法棋子
+                        skip = False
+                        for pib in total_info.player_info_block:
+                            err = self._layout_has_invalid_piece(pib.player_layout)
+                            if err:
+                                skip = True
+                                break
+                        if skip:
+                            continue
                         for pib in total_info.player_info_block:
                             layout = pib.player_layout
                             if _layout_is_empty(layout):
@@ -2263,6 +2326,25 @@ class LayoutFilterPanel(BasePanel):
                     try:
                         raw = open(jqh_file, "rb").read()
                         boards, _ = decode_jqh_all_boards(raw)
+                        # 检查是否有非法棋子
+                        skip = False
+                        for color, board in boards.items():
+                            if all(ch == "空" for row in board for ch in row):
+                                continue
+                            for row in range(6):
+                                for col in range(5):
+                                    if (row, col) in self.CAMP_POSITIONS:
+                                        continue
+                                    ch = board[row][col] if row < len(board) and col < len(board[row]) else "空"
+                                    if ch == "空":
+                                        skip = True
+                                        break
+                                if skip:
+                                    break
+                            if skip:
+                                break
+                        if skip:
+                            continue
                         for color, board in boards.items():
                             if all(ch == "空" for row in board for ch in row):
                                 continue
@@ -2767,6 +2849,25 @@ class ConditionalProbabilityPanel(BasePanel):
                         try:
                             raw = open(jqh_file, "rb").read()
                             boards, _ = decode_jqh_all_boards(raw)
+                            # 检查是否有非法棋子
+                            skip = False
+                            for color, board in boards.items():
+                                if all(ch == "空" for row in board for ch in row):
+                                    continue
+                                for row in range(6):
+                                    for col in range(5):
+                                        if (row, col) in self.CAMP_POSITIONS:
+                                            continue
+                                        ch = board[row][col] if row < len(board) and col < len(board[row]) else "空"
+                                        if ch == "空":
+                                            skip = True
+                                            break
+                                    if skip:
+                                        break
+                                if skip:
+                                    break
+                            if skip:
+                                continue
                             for color, board in boards.items():
                                 if all(ch == "空" for row in board for ch in row):
                                     continue
@@ -2796,6 +2897,15 @@ class ConditionalProbabilityPanel(BasePanel):
                     for i, jgs_file in enumerate(files):
                         try:
                             total_info = load_total_info(jgs_file)
+                            # 检查是否有非法棋子
+                            skip = False
+                            for pib in total_info.player_info_block:
+                                err = self._layout_has_invalid_piece(pib.player_layout)
+                                if err:
+                                    skip = True
+                                    break
+                            if skip:
+                                continue
                             for pib in total_info.player_info_block:
                                 layout = pib.player_layout
                                 if all(layout.item(r, c) == ItemType.JQNone
