@@ -2076,6 +2076,304 @@ class AdvancedFilterPanel(ttk.Frame):
         self.clear_stats()
 
 
+class LayoutFilterPanel(BasePanel):
+    """按布阵文件筛选面板: 加载 .jqs/.jql 布阵文件，直接比对复盘布阵
+
+    不做顺逆时针旋转，不做旗侧视角镜像，直接逐格比对。
+    同时支持 QQ(.jgs) 和联众(.jqh) 两种复盘来源。
+    """
+
+    def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar):
+        super().__init__(parent, padding=2)
+        self._folder_var = folder_var
+        self._source_var = source_var
+        self._loaded_layout = None
+        self._loaded_layout_source = ""
+        self._file_filter_matched = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        # 第一行: 加载布阵文件 + 状态
+        row1 = ttk.Frame(self)
+        row1.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(row1, text="加载布阵文件", command=self._load_layout_file).pack(side=tk.LEFT)
+        self.file_filter_result_var = tk.StringVar(value="请加载 .jqs 或 .jql 布阵文件")
+        ttk.Label(row1, textvariable=self.file_filter_result_var).pack(side=tk.LEFT, padx=(10, 0))
+
+        # 第二行: 统计 + 导出复盘 + 结果
+        row2 = ttk.Frame(self)
+        row2.pack(fill=tk.X, pady=(0, 5))
+        self.file_stat_btn = ttk.Button(row2, text="统计匹配", command=self._start_stat)
+        self.file_stat_btn.pack(side=tk.LEFT)
+        self.export_replay_btn = ttk.Button(row2, text="导出复盘", command=self._export_replays, state=tk.DISABLED)
+        self.export_replay_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.file_filter_match_var = tk.StringVar(value="")
+        ttk.Label(row2, textvariable=self.file_filter_match_var).pack(side=tk.LEFT, padx=(15, 0))
+
+        # 布阵显示网格
+        self.file_layout_grid = ttk.Frame(self)
+        self.file_layout_grid.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.file_layout_labels = []
+        for row in range(6):
+            row_labels = []
+            for col in range(5):
+                lbl = tk.Label(self.file_layout_grid, text="", bg="#FFFFFF",
+                               relief=tk.RIDGE, bd=1, font=("Consolas", 10),
+                               width=8, height=2)
+                lbl.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
+                row_labels.append(lbl)
+            self.file_layout_labels.append(row_labels)
+        for col in range(5):
+            self.file_layout_grid.columnconfigure(col, weight=1)
+
+    def _load_layout_file(self) -> None:
+        """加载布阵文件 (.jqs 或 .jql)"""
+        top = self.winfo_toplevel()
+        geo = top.geometry()
+        file_path = filedialog.askopenfilename(
+            title="选择布阵文件",
+            filetypes=[("布阵文件", "*.jqs *.jql"), ("联众布阵", "*.jqs"), ("QQ布阵", "*.jql")],
+            parent=top)
+        top.geometry(geo)
+        if not file_path:
+            return
+
+        try:
+            ext = Path(file_path).suffix.lower()
+            raw = open(file_path, "rb").read()
+
+            if ext == ".jqs":
+                from src.lianzhong import parse_jqs_layout
+                from src.lianzhong import get_char_to_itemtype
+                c2i = get_char_to_itemtype()
+                board_str = parse_jqs_layout(raw)
+                self._loaded_layout = [[c2i.get(ch, ItemType.JQNone) for ch in row] for row in board_str]
+                self._loaded_layout_source = "联众"
+            elif ext == ".jql":
+                JQL_LAYOUT_OFFSET = 0x14
+                layout = []
+                for row in range(6):
+                    row_items = []
+                    for col in range(5):
+                        offset = JQL_LAYOUT_OFFSET + row * 5 + col
+                        v = raw[offset] if offset < len(raw) else 0
+                        try:
+                            row_items.append(ItemType(v))
+                        except ValueError:
+                            row_items.append(ItemType.JQNone)
+                    layout.append(row_items)
+                self._loaded_layout = layout
+                self._loaded_layout_source = "QQ"
+            else:
+                messagebox.showerror("错误", f"不支持的文件格式: {ext}", parent=self._top)
+                return
+
+            # 显示布阵
+            self._display_loaded_layout()
+            self.file_filter_result_var.set(
+                f"已加载 {Path(file_path).name} ({self._loaded_layout_source}格式)")
+            self.file_filter_match_var.set("")
+            self._file_filter_matched = []
+            self.export_replay_btn.config(state=tk.DISABLED)
+
+        except Exception as e:
+            messagebox.showerror("加载失败", str(e), parent=self._top)
+
+    def _display_loaded_layout(self) -> None:
+        """在网格中显示已加载的布阵"""
+        from src.jgs_types import item_type2string
+        for row in range(6):
+            for col in range(5):
+                lbl = self.file_layout_labels[row][col]
+                if (row, col) in self.CAMP_POSITIONS:
+                    lbl.config(text="", bg="#D0D0D0")
+                elif self._loaded_layout:
+                    pt = self._loaded_layout[row][col]
+                    lbl.config(text=item_type2string(pt), bg="#FFFFFF")
+                else:
+                    lbl.config(text="", bg="#FFFFFF")
+
+    def _match_layout_vs_target(self, layout, target) -> bool:
+        """检查QQ布阵是否与目标布阵完全匹配 (不做镜像)"""
+        for row in range(6):
+            for col in range(5):
+                if (row, col) in self.CAMP_POSITIONS:
+                    continue
+                if layout.item(row, col) != target[row][col]:
+                    return False
+        return True
+
+    def _match_layout_vs_target_matrix(self, board_types, target) -> bool:
+        """检查联众布阵是否与目标布阵完全匹配 (不做镜像)"""
+        for row in range(6):
+            for col in range(5):
+                if (row, col) in self.CAMP_POSITIONS:
+                    continue
+                if board_types[row][col] != target[row][col]:
+                    return False
+        return True
+
+    def _start_stat(self) -> None:
+        """开始按布阵文件筛选统计"""
+        if self._loaded_layout is None:
+            messagebox.showwarning("提示", "请先加载布阵文件", parent=self._top)
+            return
+
+        folder = self._folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning("提示", "请先选择有效的文件夹", parent=self._top)
+            return
+
+        self.file_stat_btn.config(state=tk.DISABLED)
+        self.export_replay_btn.config(state=tk.DISABLED)
+        self.file_filter_match_var.set("统计中……")
+
+        target_layout = self._loaded_layout
+        progress = [0]
+        total_ref = [0]
+
+        def worker():
+            try:
+                matched = []
+
+                # 搜索 .jgs 文件
+                from src.layout_stats import find_jgs_files, load_total_info, _layout_is_empty
+                jgs_files = find_jgs_files(folder)
+                total_ref[0] += len(jgs_files)
+                for jgs_file in jgs_files:
+                    try:
+                        total_info = load_total_info(jgs_file)
+                        for pib in total_info.player_info_block:
+                            layout = pib.player_layout
+                            if _layout_is_empty(layout):
+                                continue
+                            if self._match_layout_vs_target(layout, target_layout):
+                                matched.append((jgs_file, "QQ", layout))
+                    except Exception:
+                        pass
+                    progress[0] += 1
+
+                # 搜索 .jqh 文件
+                from src.lianzhong import decode_jqh_all_boards, get_char_to_itemtype
+                c2i = get_char_to_itemtype()
+                pattern = os.path.join(folder, "**", "*.jqh")
+                jqh_files = sorted(glob.glob(pattern, recursive=True))
+                total_ref[0] += len(jqh_files)
+                for jqh_file in jqh_files:
+                    try:
+                        raw = open(jqh_file, "rb").read()
+                        boards, _ = decode_jqh_all_boards(raw)
+                        for color, board in boards.items():
+                            if all(ch == "空" for row in board for ch in row):
+                                continue
+                            board_types = [[c2i.get(ch, ItemType.JQNone) for ch in row] for row in board]
+                            if self._match_layout_vs_target_matrix(board_types, target_layout):
+                                matched.append((jqh_file, color, board_types))
+                    except Exception:
+                        pass
+                    progress[0] += 1
+
+                self._file_filter_result = (matched, total_ref[0], None)
+            except Exception as e:
+                self._file_filter_result = ([], 0, str(e))
+
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
+        self._progress_timer = self.after(200, self._update_progress, progress, total_ref)
+        self.after(100, self._poll_worker)
+
+    def _update_progress(self, progress, total_ref):
+        """更新进度显示"""
+        if hasattr(self, '_worker') and self._worker.is_alive():
+            self.file_filter_match_var.set(f"统计中…… {progress[0]}/{total_ref[0]}")
+            self._progress_timer = self.after(200, self._update_progress, progress, total_ref)
+
+    def _poll_worker(self) -> None:
+        try:
+            if self._worker.is_alive():
+                self.after(100, self._poll_worker)
+                return
+
+            matched, total, err = self._file_filter_result
+            if hasattr(self, 'file_stat_btn') and self.file_stat_btn.winfo_exists():
+                self.file_stat_btn.config(state=tk.NORMAL)
+
+            if err:
+                self.file_filter_match_var.set(f"统计失败: {err}")
+                messagebox.showerror("错误", err, parent=self._top)
+                return
+
+            self._file_filter_matched = matched
+            match_count = len(matched)
+            unique_files = len(set(fp for fp, _, _ in matched)) if matched else 0
+            self.file_filter_match_var.set(f"匹配布阵: {match_count}  去重复盘: {unique_files}/{total}")
+            has_match = match_count > 0
+            if hasattr(self, 'export_replay_btn') and self.export_replay_btn.winfo_exists():
+                self.export_replay_btn.config(state=tk.NORMAL if has_match else tk.DISABLED)
+        except Exception:
+            pass
+
+    def _export_replays(self) -> None:
+        """导出匹配的复盘文件（按文件去重）"""
+        if not self._file_filter_matched:
+            messagebox.showwarning("提示", "没有可导出的复盘", parent=self._top)
+            return
+
+        top = self.winfo_toplevel()
+        geo = top.geometry()
+        save_dir = filedialog.askdirectory(title="选择导出目录", parent=top)
+        top.geometry(geo)
+        if not save_dir:
+            return
+
+        try:
+            seen_files = set()
+            unique_files = []
+            for file_path, source, layout_data in self._file_filter_matched:
+                if file_path not in seen_files:
+                    seen_files.add(file_path)
+                    unique_files.append(file_path)
+
+            total_count = len(unique_files)
+            prefix_digits = int(math.log10(total_count)) + 1 if total_count > 0 else 1
+
+            exported = 0
+            used_names = set()
+            import shutil
+            for i, src_path in enumerate(unique_files):
+                original_name = Path(src_path).name
+                ext = Path(src_path).suffix
+                new_filename = f"{i:0{prefix_digits}d}_{original_name}"
+                counter = 1
+                base = new_filename
+                while new_filename in used_names:
+                    new_filename = f"{Path(base).stem}_{counter}{ext}"
+                    counter += 1
+                used_names.add(new_filename)
+
+                output_path = os.path.join(save_dir, new_filename)
+                shutil.copy2(src_path, output_path)
+                exported += 1
+                self.file_filter_match_var.set(f"导出中…… {exported}/{total_count}")
+
+            messagebox.showinfo("完成", f"成功导出 {exported} 个复盘文件(去重后)到:\n{save_dir}", parent=self._top)
+            self.file_filter_match_var.set(f"已导出 {exported} 个复盘文件")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e), parent=self._top)
+
+    def clear_stats(self) -> None:
+        """清空统计结果"""
+        self._file_filter_matched = []
+        if hasattr(self, 'file_filter_match_var'):
+            self.file_filter_match_var.set("")
+        if hasattr(self, 'export_replay_btn') and self.export_replay_btn.winfo_exists():
+            self.export_replay_btn.config(state=tk.DISABLED)
+
+    def _refresh_grid(self) -> None:
+        """方向变化时清空结果"""
+        self.clear_stats()
+
+
 class ConditionalProbabilityPanel(BasePanel):
     """条件概率筛选面板: 左侧拖拽面板 + 中间条件面板 + 右侧结果面板"""
 
@@ -2903,10 +3201,8 @@ class StatsGUI:
         # 联众专属 tabs (index 4, 5, 6)
         for i in (4, 5, 6):
             self.notebook.tab(i, state="normal" if is_lianzhong else "hidden")
-        # 高级筛选 tab (index 7) 始终隐藏
-        self.notebook.tab(7, state="hidden")
-        # 公共 tabs 始终显示
-        for i in (0, 8):
+        # 公共 tabs 始终显示 (0=棋子维度, 7=按布阵筛选, 8=条件概率)
+        for i in (0, 7, 8):
             self.notebook.tab(i, state="normal")
 
         # 选项卡跳转逻辑:
@@ -2947,14 +3243,14 @@ class StatsGUI:
         """清空所有面板的统计结果"""
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
-                     self.advanced_filter_panel, self.conditional_panel):
+                     self.layout_filter_panel, self.conditional_panel):
             panel.clear_stats()
 
     def _on_direction_change(self) -> None:
         # 重绘所有已有统计结果的面板
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
-                     self.advanced_filter_panel, self.conditional_panel):
+                     self.layout_filter_panel, self.conditional_panel):
             panel._refresh_grid()
         # 条件概率面板: 更新旗侧视角下(5,1)位置的显示
         self.conditional_panel.update_for_direction()
@@ -2963,7 +3259,7 @@ class StatsGUI:
         """切换百分比/数量显示模式"""
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
-                     self.advanced_filter_panel, self.conditional_panel):
+                     self.layout_filter_panel, self.conditional_panel):
             panel._refresh_grid()
 
     def _on_dedup_change(self) -> None:
@@ -3032,13 +3328,10 @@ class StatsGUI:
         self.notebook.add(self.lz_id_panel, text="联众ID统计")
         self.notebook.tab(6, state="hidden")
 
-        # 高级筛选 (index=7, 始终隐藏)
-        self.advanced_filter_panel = AdvancedFilterPanel(
-            self.notebook, self.folder_var, self.source_var,
-            direction_getter=lambda: self.direction_var.get(),
-            is_mainline_getter=self._is_mainline)
-        self.notebook.add(self.advanced_filter_panel, text="高级筛选")
-        self.notebook.tab(7, state="hidden")
+        # 按布阵筛选 (index=7, 始终显示)
+        self.layout_filter_panel = LayoutFilterPanel(
+            self.notebook, self.folder_var, self.source_var)
+        self.notebook.add(self.layout_filter_panel, text="按布阵筛选")
 
         # 条件概率筛选 (index=8, 始终显示)
         self.conditional_panel = ConditionalProbabilityPanel(
