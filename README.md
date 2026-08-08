@@ -2,9 +2,19 @@
 
 [github下载地址](https://github.com/math-yyj/JQ_Replay_Stat/releases/tag/v0.2.3)
 
-[百度网盘分流下载地址](https://pan.baidu.com/s/1XxGJvJ9cNlvocG7aJ5BXuA?pwd=ia3i)
+[百度网盘分流下载地址](https://pan.baidu.com/s/1l7ONXQTezOhxzpIPrCWM_w?pwd=zymy)
 
 感谢 [@windsgo](https://github.com/windsgo) 的[先行工作](https://github.com/windsgo/myjgs)！
+
+## 运行效果
+
+![qq](docs/images/qq.png)
+
+![lianzhong](docs/images/lianzhong.png)
+
+![conditional_filter](docs/images/conditional_filter.png)
+
+![layout_filter](docs/images/layout_filter.png)
 
 ## 已支持功能
 
@@ -108,12 +118,6 @@ QQ复盘布阵校验规则：
 
 ## 待实现
 
-* [ ] 按照条件筛选和导出对局文件
 * [ ] QQ复盘文件对局全内容解析
 * [ ] 联众复盘文件对局全内容解析
 
-## 运行效果
-
-![qq](docs/images/qq.png)
-
-![lianzhong](docs/images/lianzhong.png)
