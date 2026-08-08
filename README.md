@@ -2,7 +2,7 @@
 
 [github下载地址](https://github.com/math-yyj/JQ_Replay_Stat/releases/tag/v0.2.3)
 
-[百度网盘分流下载地址](https://pan.baidu.com/s/1l7ONXQTezOhxzpIPrCWM_w?pwd=zymy)
+[百度网盘分流下载地址](https://pan.baidu.com/s/1l7ONXQTezOhxzpIPrCWM_w?pwd=aitd)
 
 感谢 [@windsgo](https://github.com/windsgo) 的[先行工作](https://github.com/windsgo/myjgs)！
 
