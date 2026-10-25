@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import math
 import os
 import struct
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src import LayoutStats, ItemColor, ItemType
 from src.block import JGSLayoutBlock
 from src.layout_stats import next_mover, partner, prev_mover
+from src.qq_replay import COLOR_ORDER, DIR_CN, PIECE_SHORT, parse_jgs
 
 ROW_TITLES = ["第1行", "第2行", "第3行", "第4行", "第5行", "第6行"]
 
@@ -3214,6 +3216,382 @@ class ConditionalProbabilityPanel(BasePanel):
             messagebox.showerror("导出失败", str(e), parent=self._top)
 
 
+class QQReplayPanel(ttk.Frame):
+    """QQ 复盘完整对局解析: 单文件解析、布阵/行棋/得失展示与导出"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.replay = None
+        self.analysis = None
+        self.file_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="请选择 .jgs 复盘文件")
+        self.stats_summary_var = tk.StringVar(value="")
+        self._layout_labels: dict[tuple[str, int, int], tk.Label] = {}
+        self._layout_groups: dict[str, ttk.LabelFrame] = {}
+        self._layout_headers: dict[str, ttk.Label] = {}
+        self._build_ui()
+
+    @property
+    def _top(self):
+        return self.winfo_toplevel()
+
+    def _build_ui(self) -> None:
+        bar = ttk.Frame(self, padding=(0, 0, 0, 6))
+        bar.pack(fill=tk.X)
+        ttk.Button(bar, text="选择复盘...", command=self._choose_file).pack(side=tk.LEFT)
+        ttk.Label(bar, text="文件:").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(bar, text="清空", command=self._clear).pack(side=tk.RIGHT)
+        self.export_text_btn = ttk.Button(
+            bar, text="导出文本", command=self._export_text, state=tk.DISABLED)
+        self.export_text_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        self.export_json_btn = ttk.Button(
+            bar, text="导出 JSON", command=self._export_json, state=tk.DISABLED)
+        self.export_json_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(bar, text="解析", command=self._parse_current).pack(side=tk.RIGHT)
+        entry = ttk.Entry(bar, textvariable=self.file_var, width=62)
+        entry.pack(side=tk.LEFT, padx=(4, 4), fill=tk.X, expand=True)
+        entry.bind("<Return>", lambda _e: self._parse_current())
+
+        ttk.Label(self, textvariable=self.status_var, padding=(2, 2, 2, 0)).pack(
+            fill=tk.X, side=tk.BOTTOM)
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        self._build_overview_tab()
+        self._build_layout_tab()
+        self._build_moves_tab()
+        self._build_stats_tab()
+
+    def _build_overview_tab(self) -> None:
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="对局概览")
+        self.overview_text = tk.Text(
+            frame, wrap=tk.WORD, font=("Microsoft YaHei UI", 10),
+            state=tk.DISABLED, padx=10, pady=8)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.overview_text.yview)
+        self.overview_text.configure(yscrollcommand=scroll.set)
+        self.overview_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.overview_text.tag_configure("heading", font=("Microsoft YaHei UI", 11, "bold"))
+        self.overview_text.tag_configure("warn", foreground="#B00000")
+
+    def _build_layout_tab(self) -> None:
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="四方布阵")
+        for i, color in enumerate(COLOR_ORDER):
+            group = ttk.LabelFrame(frame, text=color)
+            group.grid(row=i // 2, column=i % 2, sticky="nsew", padx=6, pady=6)
+            frame.grid_rowconfigure(i // 2, weight=1)
+            frame.grid_columnconfigure(i % 2, weight=1)
+            header = ttk.Label(group, text="", font=("Microsoft YaHei UI", 10, "bold"))
+            header.pack(anchor=tk.W, padx=6, pady=(4, 2))
+            self._layout_headers[color] = header
+            grid = ttk.Frame(group)
+            grid.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+            for row in range(6):
+                grid.grid_rowconfigure(row, weight=1)
+                for col in range(5):
+                    grid.grid_columnconfigure(col, weight=1)
+                    lbl = tk.Label(
+                        grid, text="", width=3, height=1, relief=tk.SOLID, bd=1,
+                        bg=CELL_BG, font=("Microsoft YaHei UI", 13, "bold"))
+                    lbl.grid(row=row, column=col, sticky="nsew", padx=1, pady=1)
+                    self._layout_labels[(color, row, col)] = lbl
+            self._layout_groups[color] = group
+
+    def _build_moves_tab(self) -> None:
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="行棋记录")
+        columns = ("no", "color", "start", "end", "result", "event", "net")
+        self.moves_tree = ttk.Treeview(frame, columns=columns, show="headings")
+        titles = {
+            "no": ("序号", 60), "color": ("颜色", 60), "start": ("起点", 90),
+            "end": ("终点", 90), "result": ("结果", 160), "event": ("关键事件", 320),
+            "net": ("子力变化", 180),
+        }
+        for key, (title, width) in titles.items():
+            self.moves_tree.heading(key, text=title)
+            self.moves_tree.column(key, width=width, anchor=tk.CENTER, stretch=(key == "event"))
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.moves_tree.yview)
+        self.moves_tree.configure(yscrollcommand=scroll.set)
+        self.moves_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.moves_tree.tag_configure("event", background="#FFF6D8")
+        self.moves_tree.tag_configure("error", background="#FFE0E0")
+
+    def _build_stats_tab(self) -> None:
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="子力统计")
+        ttk.Label(
+            frame, textvariable=self.stats_summary_var,
+            font=("Microsoft YaHei UI", 10, "bold"), padding=(8, 8, 8, 4),
+        ).pack(fill=tk.X)
+        columns = (
+            "player", "seat", "steps", "eat", "killed", "both", "bomb_kill",
+            "bomb_hit", "dig", "flag", "mine", "mistakes", "score", "loss", "net",
+        )
+        titles = {
+            "player": ("玩家", 150), "seat": ("座位", 60), "steps": ("步数", 55),
+            "eat": ("吃子", 55), "killed": ("被吃", 55), "both": ("同尽", 55),
+            "bomb_kill": ("炸杀", 55), "bomb_hit": ("中炸", 55), "dig": ("挖雷", 55),
+            "flag": ("扛旗", 55), "mine": ("触雷", 55), "mistakes": ("失着", 55),
+            "score": ("得分", 65), "loss": ("损失", 65), "net": ("净值", 65),
+        }
+        self.stats_tree = ttk.Treeview(frame, columns=columns, show="headings")
+        for key, (title, width) in titles.items():
+            self.stats_tree.heading(key, text=title)
+            self.stats_tree.column(key, width=width, anchor=tk.CENTER,
+                                   stretch=(key == "player"))
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.stats_tree.yview)
+        self.stats_tree.configure(yscrollcommand=scroll.set)
+        self.stats_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _choose_file(self) -> None:
+        top = self._top
+        geo = top.geometry()
+        path = filedialog.askopenfilename(
+            title="选择 QQ 复盘文件", parent=top,
+            filetypes=[("QQ 复盘", "*.jgs"), ("所有文件", "*.*")])
+        top.geometry(geo)
+        if path:
+            self.file_var.set(path)
+            self._parse_current()
+
+    def _parse_current(self) -> None:
+        path = self.file_var.get().strip()
+        if not path:
+            messagebox.showwarning("提示", "请先选择 .jgs 复盘文件", parent=self._top)
+            return
+        try:
+            replay = parse_jgs(path)
+            analysis = replay.analyze()
+        except Exception as exc:
+            self.replay = None
+            self.analysis = None
+            self.export_json_btn.config(state=tk.DISABLED)
+            self.export_text_btn.config(state=tk.DISABLED)
+            self._refresh_overview()
+            self._refresh_layouts()
+            self._refresh_moves()
+            self._refresh_stats()
+            self.status_var.set(f"解析失败: {exc}")
+            messagebox.showerror("解析失败", str(exc), parent=self._top)
+            return
+        self._set_replay(replay, analysis)
+
+    def _set_replay(self, replay, analysis) -> None:
+        self.replay = replay
+        self.analysis = analysis
+        self.file_var.set(replay.path)
+        self.export_json_btn.config(state=tk.NORMAL)
+        self.export_text_btn.config(state=tk.NORMAL)
+        self._refresh_overview()
+        self._refresh_layouts()
+        self._refresh_moves()
+        self._refresh_stats()
+        self.status_var.set(
+            f"解析完成: {Path(replay.path).name}  "
+            f"棋步 {replay.move_count} / 事件 {replay.event_count}  "
+            f"方位自洽率 {replay.self_check_rate * 100:.1f}%  "
+            f"异常步数 {analysis.error_count}")
+
+    def _clear(self) -> None:
+        self.replay = None
+        self.analysis = None
+        self.file_var.set("")
+        self.export_json_btn.config(state=tk.DISABLED)
+        self.export_text_btn.config(state=tk.DISABLED)
+        self.status_var.set("请选择 .jgs 复盘文件")
+        self._refresh_overview()
+        self._refresh_layouts()
+        self._refresh_moves()
+        self._refresh_stats()
+
+    def _refresh_overview(self) -> None:
+        widget = self.overview_text
+        widget.config(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        if self.replay is None or self.analysis is None:
+            widget.config(state=tk.DISABLED)
+            return
+        replay = self.replay
+        analysis = self.analysis
+        lines = [
+            ("heading", "基础信息\n"),
+            ("", f"文件: {replay.path}\n"),
+            ("", f"大小: {replay.file_size} 字节\n"),
+            ("", f"头部步数: {replay.header_steps}（含结束事件）   "
+                 f"实际步数: {len(replay.seq)}（棋步 {replay.move_count} / "
+                 f"事件 {replay.event_count}）\n"),
+        ]
+        my_name = replay.players.get(replay.my_color, "") if replay.my_color else ""
+        lines.append(("", f"己方: {replay.my_color or '未知'}"
+                          f"{'（' + my_name + '）' if my_name else ''}\n"))
+        directions = "  ".join(
+            f"{block.color}={DIR_CN.get(block.orient, block.orient)}" for block in replay.blocks)
+        seats = "  ".join(f"{block.color}={block.seat}" for block in replay.blocks)
+        lines.append(("", f"方位: {directions}\n"))
+        lines.append(("", f"座位: {seats}\n"))
+        lines.append(("", f"行棋顺序: {' → '.join(replay.turn_order)}\n"))
+        lines.append(("", f"方位自洽率: {replay.self_check_rate * 100:.1f}%\n"))
+        lines.append(("", f"结果: {analysis.result_text}\n"))
+        audit_tag = "warn" if analysis.error_count else ""
+        lines.append((audit_tag, f"数据自洽: {analysis.error_count} 步异常\n"))
+
+        lines.append(("heading", "\n四方玩家\n"))
+        for block in replay.blocks:
+            qq = f"  QQ: {block.qq_number}" if block.qq_number else ""
+            lines.append(("", f"{block.color} · {block.seat} · {block.name}{qq}\n"))
+
+        key_events = [
+            step for step in analysis.steps
+            if step.resolved is not None
+            and step.resolved.event_text
+            and step.resolved.severity >= 2
+        ]
+        if key_events:
+            lines.append(("heading", "\n关键事件\n"))
+            for step in key_events[:30]:
+                lines.append(("", f"第 {step.no} 步  {step.resolved.event_text}\n"))
+            if len(key_events) > 30:
+                lines.append(("", f"其余 {len(key_events) - 30} 条已省略，详见行棋记录\n"))
+
+        if analysis.errors:
+            lines.append(("heading", "\n数据异常\n"))
+            for step_no, desc in analysis.errors[:10]:
+                lines.append(("warn", f"第 {step_no} 步: {desc}\n"))
+            if len(analysis.errors) > 10:
+                lines.append(("warn", f"其余 {len(analysis.errors) - 10} 条已省略\n"))
+
+        for tag, text in lines:
+            widget.insert(tk.END, text, tag if tag else ())
+        widget.config(state=tk.DISABLED)
+
+    def _refresh_layouts(self) -> None:
+        for color in COLOR_ORDER:
+            group = self._layout_groups.get(color)
+            header = self._layout_headers.get(color)
+            block = next((b for b in self.replay.blocks if b.color == color), None) \
+                if self.replay else None
+            if block is not None:
+                group.config(text=f"{color} · {block.seat}")
+                header.config(text=block.name)
+            else:
+                group.config(text=color)
+                header.config(text="")
+            for row in range(6):
+                for col in range(5):
+                    lbl = self._layout_labels.get((color, row, col))
+                    if lbl is None:
+                        continue
+                    if (row, col) in CAMP_POSITIONS:
+                        lbl.config(text="", bg=CAMP_BG)
+                    elif block is not None:
+                        code = block.matrix[row * 5 + col]
+                        lbl.config(
+                            text=PIECE_SHORT.get(code, "?"), bg=CELL_BG,
+                            fg="#B00000" if code == int(ItemType.Junqi) else "#000000")
+                    else:
+                        lbl.config(text="", bg=CELL_BG)
+
+    def _refresh_moves(self) -> None:
+        self._clear_tree(self.moves_tree)
+        if self.analysis is None:
+            return
+        for step in self.analysis.steps:
+            if step.kind == "event":
+                values = (step.no, step.event.color or "", "", "", "事件",
+                          step.event_text, "")
+                self.moves_tree.insert("", tk.END, values=values, tags=("event",))
+                continue
+            resolved = step.resolved
+            values = (
+                step.no,
+                step.move.color,
+                f"{step.move.start[0]},{step.move.start[1]}",
+                f"{step.move.end[0]},{step.move.end[1]}",
+                resolved.desc,
+                resolved.event_text or "",
+                self._format_delta(resolved.delta),
+            )
+            tags = ("error",) if resolved.error else ()
+            self.moves_tree.insert("", tk.END, values=values, tags=tags)
+        self.moves_tree.yview_moveto(0)
+
+    def _refresh_stats(self) -> None:
+        self._clear_tree(self.stats_tree)
+        if self.replay is None or self.analysis is None:
+            self.stats_summary_var.set("")
+            return
+        analysis = self.analysis
+        self.stats_summary_var.set(
+            f"结果: {analysis.result_text}    方位自洽率: "
+            f"{self.replay.self_check_rate * 100:.1f}%    数据异常: "
+            f"{analysis.error_count} 步")
+        for color in COLOR_ORDER:
+            stats = analysis.stats.get(color)
+            block = next((b for b in self.replay.blocks if b.color == color), None)
+            if stats is None or block is None:
+                continue
+            values = (
+                f"{color} {block.name}", block.seat, stats.steps, stats.eat,
+                stats.killed, stats.both, stats.bomb_kill, stats.bomb_hit,
+                stats.dig, stats.flag, stats.mine, stats.mistakes,
+                stats.score, stats.loss, stats.net,
+            )
+            self.stats_tree.insert("", tk.END, values=values)
+
+    @staticmethod
+    def _clear_tree(tree: ttk.Treeview) -> None:
+        for item in tree.get_children():
+            tree.delete(item)
+
+    @staticmethod
+    def _format_delta(delta: dict[str, int]) -> str:
+        return "  ".join(f"{color}{value:+d}" for color, value in delta.items() if value)
+
+    def _export_json(self) -> None:
+        if self.replay is None:
+            return
+        top = self._top
+        geo = top.geometry()
+        path = filedialog.asksaveasfilename(
+            title="导出解析 JSON", parent=top, defaultextension=".json",
+            initialfile=f"{Path(self.replay.path).stem}_解析.json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")])
+        top.geometry(geo)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.replay.to_dict(), f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc), parent=top)
+            return
+        messagebox.showinfo("完成", f"已导出: {path}", parent=top)
+
+    def _export_text(self) -> None:
+        if self.replay is None:
+            return
+        top = self._top
+        geo = top.geometry()
+        path = filedialog.asksaveasfilename(
+            title="导出复盘文本", parent=top, defaultextension=".txt",
+            initialfile=f"{Path(self.replay.path).stem}_复盘v2.txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+        top.geometry(geo)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.replay.to_text())
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc), parent=top)
+            return
+        messagebox.showinfo("完成", f"已导出: {path}", parent=top)
+
+
 class StatsGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -3303,8 +3681,8 @@ class StatsGUI:
                 self.direction_var.set("逆时针")
 
         # 显示/隐藏平台专属tabs
-        # QQ专属 tabs (index 1, 3)
-        for i in (1, 3):
+        # QQ专属 tabs (index 1, 3, 9)
+        for i in (1, 3, 9):
             self.notebook.tab(i, state="hidden" if is_lianzhong else "normal")
         # 主视角 tab (index 2) 始终隐藏
         self.notebook.tab(2, state="hidden")
@@ -3450,6 +3828,10 @@ class StatsGUI:
             direction_getter=lambda: self.direction_var.get(),
             is_mainline_getter=self._is_mainline)
         self.notebook.add(self.conditional_panel, text="条件概率筛选")
+
+        # QQ复盘完整解析 (index=9, 仅QQ)
+        self.qq_replay_panel = QQReplayPanel(self.notebook)
+        self.notebook.add(self.qq_replay_panel, text="QQ复盘解析")
 
         # QQ/联众选项卡对应关系 (用于切换平台时保持位置)
         self._qq_to_lz_tab = {1: 4, 3: 6}  # QQ index -> 联众 index
