@@ -14,6 +14,7 @@ import glob
 import json
 import math
 import os
+import queue
 import struct
 import sys
 import threading
@@ -26,7 +27,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src import LayoutStats, ItemColor, ItemType
 from src.block import JGSLayoutBlock
 from src.layout_stats import next_mover, partner, prev_mover
+from src.qq_board import (
+    CANONICAL_SEAT, COLOR_FILL, COLOR_LINE, COLOR_TEXT, COLOR_TEXT_ON,
+    PIECE_ORDER, RAIL_LINES, REGION_FILL, SEAT_COLORS, can_hold_piece,
+    cell_kind, iter_states, layout_is_valid, legal_cells,
+    normalize_board, region_of, rotation_times,
+)
 from src.qq_replay import COLOR_ORDER, DIR_CN, PIECE_SHORT, parse_jgs
+from src.glworld_replay import (
+    COLOR_CN as GL_COLOR_CN,
+    COLOR_ORDER as GL_COLOR_ORDER,
+    PIECE_NAME as GL_PIECE_NAME,
+    ROW_LETTERS as GL_ROW_LETTERS,
+    parse_glworld_text,
+)
 
 ROW_TITLES = ["第1行", "第2行", "第3行", "第4行", "第5行", "第6行"]
 
@@ -3592,6 +3606,1095 @@ class QQReplayPanel(ttk.Frame):
         messagebox.showinfo("完成", f"已导出: {path}", parent=top)
 
 
+class QQBatchPanel(ttk.Frame):
+    """QQ 复盘批量统计：四色×12 棋子条件 + 17×17 条件/结果棋盘"""
+
+    CELL = 26
+    MARGIN = 15
+
+    def __init__(self, parent, folder_var: tk.StringVar, display_mode_getter=None):
+        super().__init__(parent, padding=2)
+        self._folder_var = folder_var
+        self._display_mode_getter = display_mode_getter or (lambda: "百分比")
+        self._selected: tuple[str, int] | None = None
+        self._legal: set[tuple[int, int]] = set()
+        self._conditions: dict[tuple[int, int], set[tuple[str, int]]] = {}
+        self._active_cells: set[tuple[int, int]] = set()
+        self._result_counts: dict[tuple[int, int], dict[tuple[str, int], int]] = {}
+        self._match_total = 0
+        self._snapshot_total = 0
+        self._stored_result = None
+        self._stored_mode = None
+        self._worker = None
+        self._progress_queue: queue.Queue = queue.Queue()
+        self._drag = None
+        self._piece_buttons: dict[tuple[str, int], tk.Label] = {}
+        self.first_only_var = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(
+            value="拖拽或点击左侧棋子；可配置全盘，旗/雷限初始位；结果格需左键点亮")
+        self.cond_hover_var = tk.StringVar(
+            value="旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右；悬停条件格查看格内“或”条件")
+        self._build_ui()
+
+    @property
+    def _top(self):
+        return self.winfo_toplevel()
+
+    @property
+    def _board_size(self) -> int:
+        return self.MARGIN * 2 + 17 * self.CELL
+
+    def _build_ui(self) -> None:
+        bar = ttk.Frame(self)
+        bar.pack(fill=tk.X, pady=(0, 4))
+        controls = ttk.Frame(bar)
+        controls.pack(fill=tk.X)
+        self.stat_btn = ttk.Button(controls, text="统计", command=self._start_stat)
+        self.stat_btn.pack(side=tk.LEFT)
+        ttk.Button(controls, text="清空所有", command=self._clear_all).pack(
+            side=tk.LEFT, padx=(6, 0))
+        ttk.Checkbutton(
+            controls, text="仅统计首次满足快照", variable=self.first_only_var,
+            command=self._on_first_only_change,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(bar, textvariable=self.status_var).pack(
+            fill=tk.X, pady=(2, 0))
+
+        main = ttk.Frame(self)
+        main.pack(fill=tk.BOTH, expand=True)
+        main.grid_columnconfigure(0, weight=0)
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_columnconfigure(2, weight=1)
+        main.grid_rowconfigure(0, weight=1)
+
+        left = ttk.LabelFrame(main, text="棋子条件（四色 × 12）")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.configure(width=205)
+        left.grid_propagate(False)
+        for color in SEAT_COLORS:
+            group = ttk.LabelFrame(left, text=f"{color} · {CANONICAL_SEAT[color]}")
+            group.pack(fill=tk.X, padx=4, pady=(2, 4))
+            for idx, piece in enumerate(PIECE_ORDER):
+                row, col = divmod(idx, 6)
+                piece_code = int(piece)
+                lbl = tk.Label(
+                    group, text=PIECE_SHORT[piece_code], width=2, height=1,
+                    bg=COLOR_FILL[color], fg=COLOR_TEXT_ON[color],
+                    font=("Microsoft YaHei UI", 9, "bold"),
+                    relief=tk.RAISED, bd=1, cursor="hand2")
+                lbl.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+                lbl.bind("<ButtonPress-1>",
+                         lambda e, c=color, p=piece_code: self._on_piece_press(c, p, e))
+                lbl.bind("<B1-Motion>", self._on_piece_motion)
+                lbl.bind("<ButtonRelease-1>", self._on_piece_release)
+                self._piece_buttons[(color, piece_code)] = lbl
+            for col in range(6):
+                group.columnconfigure(col, weight=1)
+
+        cond_frame = ttk.LabelFrame(
+            main, text="条件棋盘（格内或 / 格间且；全盘可选）")
+        cond_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 6))
+        self.cond_canvas = tk.Canvas(
+            cond_frame, width=self._board_size, height=self._board_size,
+            bg="#FFFFFF", highlightthickness=0)
+        self.cond_canvas.pack(padx=4, pady=(4, 2))
+        ttk.Label(cond_frame, textvariable=self.cond_hover_var, wraplength=460).pack(
+            fill=tk.X, padx=6, pady=(0, 4))
+        self.cond_canvas.bind("<Button-1>", self._on_cond_click)
+        self.cond_canvas.bind("<Button-3>", self._on_cond_right_click)
+        self.cond_canvas.bind("<Motion>", self._on_cond_motion)
+        self.cond_canvas.bind("<Leave>", lambda _e: self.cond_hover_var.set(
+            "旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右；悬停条件格查看格内“或”条件"))
+
+        result_frame = ttk.LabelFrame(
+            main, text=self._result_title())
+        self.result_frame = result_frame
+        result_frame.grid(row=0, column=2, sticky="nsew")
+        self.result_canvas = tk.Canvas(
+            result_frame, width=self._board_size, height=self._board_size,
+            bg="#FFFFFF", highlightthickness=0)
+        self.result_canvas.pack(padx=4, pady=(4, 2))
+        self.hover_var = tk.StringVar(value="悬停已点亮格子查看前 3 名明细")
+        ttk.Label(result_frame, textvariable=self.hover_var, wraplength=460).pack(
+            fill=tk.X, padx=6, pady=(0, 4))
+        self.result_canvas.bind("<Button-1>", self._on_result_click)
+        self.result_canvas.bind("<Motion>", self._on_result_motion)
+        self.result_canvas.bind("<Leave>", lambda _e: self.hover_var.set(
+            "悬停已点亮格子查看前 3 名明细"))
+
+        self._draw_board_base(self.cond_canvas)
+        self._draw_board_base(self.result_canvas)
+        self._redraw_condition_board()
+        self._redraw_result_board()
+
+    def _bbox(self, row: int, col: int) -> tuple[int, int, int, int]:
+        x0 = self.MARGIN + col * self.CELL
+        y0 = self.MARGIN + row * self.CELL
+        return x0, y0, x0 + self.CELL, y0 + self.CELL
+
+    def _draw_board_base(self, canvas: tk.Canvas) -> None:
+        canvas.delete("all")
+        for row in range(17):
+            for col in range(17):
+                x0, y0, x1, y1 = self._bbox(row, col)
+                kind = cell_kind(row, col)
+                region = region_of(row, col)
+                if kind == ".":
+                    canvas.create_rectangle(x0, y0, x1, y1,
+                                            fill="#F7F7F7", outline="#F7F7F7")
+                    continue
+                fill = REGION_FILL.get(region, "#FAFAFA")
+                if kind == "C":
+                    fill = "#D5D5D5"
+                elif kind == "R":
+                    fill = "#F1F1F1"
+                canvas.create_rectangle(x0, y0, x1, y1, fill=fill, outline="#D8D8D8")
+                if kind == "C":
+                    canvas.create_oval(x0 + 5, y0 + 5, x1 - 5, y1 - 5,
+                                       fill="#BFBFBF", outline="#9E9E9E")
+                elif kind == "H":
+                    central = 6 <= row <= 10 and 6 <= col <= 10
+                    canvas.create_rectangle(
+                        x0 + 1, y0 + 1, x1 - 1, y1 - 1,
+                        fill="#FFF8E1" if central else "",
+                        outline="#C62828" if not central else "#E0A800",
+                        width=2 if not central else 1)
+        for orientation, index, start, end in RAIL_LINES:
+            if orientation == "h":
+                y = self.MARGIN + index * self.CELL + self.CELL / 2
+                x1 = self.MARGIN + start * self.CELL + self.CELL / 2
+                x2 = self.MARGIN + end * self.CELL + self.CELL / 2
+                canvas.create_line(x1, y, x2, y, fill="#9E7B5A", width=2,
+                                   capstyle=tk.ROUND)
+            else:
+                x = self.MARGIN + index * self.CELL + self.CELL / 2
+                y1 = self.MARGIN + start * self.CELL + self.CELL / 2
+                y2 = self.MARGIN + end * self.CELL + self.CELL / 2
+                canvas.create_line(x, y1, x, y2, fill="#9E7B5A", width=2,
+                                   capstyle=tk.ROUND)
+        border = self.MARGIN - 1
+        canvas.create_rectangle(border, border, self._board_size - border,
+                                self._board_size - border,
+                                outline="#8D6E63", width=2)
+        for col in range(17):
+            x = self.MARGIN + col * self.CELL + self.CELL / 2
+            canvas.create_text(x, self.MARGIN / 2, text=chr(65 + col),
+                               font=("Consolas", 6), fill="#666666")
+        for row in range(17):
+            y = self.MARGIN + row * self.CELL + self.CELL / 2
+            canvas.create_text(self.MARGIN / 2, y, text=str(row + 1),
+                               font=("Consolas", 6), fill="#666666")
+
+    def _on_piece_press(self, color: str, piece: int, event) -> None:
+        self._select_piece(color, piece)
+        ghost = tk.Toplevel(self)
+        ghost.overrideredirect(True)
+        ghost.attributes("-topmost", True)
+        tk.Label(
+            ghost, text=PIECE_SHORT[piece], bg=COLOR_FILL[color],
+            fg=COLOR_TEXT_ON[color], font=("Microsoft YaHei UI", 12, "bold"),
+            relief=tk.SOLID, bd=2, padx=4, pady=2,
+        ).pack()
+        ghost.geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+        ghost.withdraw()
+        self._drag = {
+            "color": color, "piece": piece, "ghost": ghost,
+            "started": False, "sx": event.x_root, "sy": event.y_root,
+        }
+
+    def _on_piece_motion(self, event) -> None:
+        if not self._drag:
+            return
+        if not self._drag["started"]:
+            if abs(event.x_root - self._drag["sx"]) + abs(event.y_root - self._drag["sy"]) <= 3:
+                return
+            self._drag["started"] = True
+            self._drag["ghost"].deiconify()
+        self._drag["ghost"].geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+
+    def _on_piece_release(self, event) -> None:
+        drag = self._drag
+        self._drag = None
+        if not drag:
+            return
+        ghost = drag["ghost"]
+        started = drag["started"]
+        if started:
+            ghost.withdraw()
+            widget = self.winfo_containing(event.x_root, event.y_root)
+            if widget is self.cond_canvas:
+                x = event.x_root - self.cond_canvas.winfo_rootx()
+                y = event.y_root - self.cond_canvas.winfo_rooty()
+                cell = self._cell_from_xy(x, y)
+                if cell and self._selected == (drag["color"], drag["piece"]):
+                    if cell in self._legal:
+                        self._add_condition(cell)
+                    else:
+                        self.status_var.set("该位置不是该棋子的合法初始位置")
+        ghost.destroy()
+
+    def _select_piece(self, color: str, piece: int) -> None:
+        for lbl in self._piece_buttons.values():
+            lbl.config(relief=tk.RAISED, bd=1, highlightthickness=0)
+        self._selected = (color, piece)
+        self._piece_buttons[(color, piece)].config(
+            relief=tk.SUNKEN, bd=2, highlightthickness=2,
+            highlightbackground="#FF6F00")
+        self._legal = legal_cells(color, piece)
+        self._redraw_condition_board()
+        self.status_var.set(
+            f"已选中: {color}-{PIECE_SHORT[piece]}；左键添加/取消，右键清空该格")
+
+    def _cell_from_xy(self, x: float, y: float) -> tuple[int, int] | None:
+        col = int((x - self.MARGIN) // self.CELL)
+        row = int((y - self.MARGIN) // self.CELL)
+        if 0 <= row < 17 and 0 <= col < 17:
+            return row, col
+        return None
+
+    def _on_cond_click(self, event) -> None:
+        if self._selected is None:
+            self.status_var.set("请先在左侧选择棋子")
+            return
+        cell = self._cell_from_xy(event.x, event.y)
+        if cell is None:
+            return
+        if cell not in self._legal:
+            self.status_var.set("该位置不是该棋子的合法初始位置")
+            return
+        self._toggle_condition(cell)
+
+    def _on_cond_right_click(self, event) -> None:
+        cell = self._cell_from_xy(event.x, event.y)
+        if cell is not None and cell in self._conditions:
+            del self._conditions[cell]
+            self._redraw_condition_board()
+            self._redraw_result_board()
+            self.status_var.set("已清空该格的全部条件")
+
+    def _toggle_condition(self, cell: tuple[int, int]) -> None:
+        if self._selected is None:
+            return
+        color, piece = self._selected
+        alternatives = self._conditions.setdefault(cell, set())
+        if (color, piece) in alternatives:
+            alternatives.discard((color, piece))
+            action = "移除"
+        else:
+            alternatives.add((color, piece))
+            action = "添加"
+        if not alternatives:
+            del self._conditions[cell]
+        self._redraw_condition_board()
+        self._redraw_result_board()
+        self.status_var.set(
+            f"{action}条件: {color}-{PIECE_SHORT[piece]} @ "
+            f"{chr(65 + cell[1])}{cell[0] + 1}")
+
+    def _add_condition(self, cell: tuple[int, int]) -> None:
+        if self._selected is None:
+            return
+        color, piece = self._selected
+        self._conditions.setdefault(cell, set()).add((color, piece))
+        self._redraw_condition_board()
+        self._redraw_result_board()
+        self.status_var.set(
+            f"条件: {color}-{PIECE_SHORT[piece]} @ "
+            f"{chr(65 + cell[1])}{cell[0] + 1}")
+
+    def _on_cond_motion(self, event) -> None:
+        cell = self._cell_from_xy(event.x, event.y)
+        if cell is None:
+            self.cond_hover_var.set(
+                "旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右；悬停条件格查看格内“或”条件")
+            return
+        row, col = cell
+        coord = f"{chr(65 + col)}{row + 1}"
+        alternatives = self._conditions.get(cell)
+        if not alternatives:
+            self.cond_hover_var.set(f"{coord}  空条件格")
+            return
+        ordered = sorted(
+            alternatives,
+            key=lambda item: (SEAT_COLORS.index(item[0]), item[1]))
+        text = "  或  ".join(
+            f"{color}-{PIECE_SHORT[piece]}" for color, piece in ordered)
+        self.cond_hover_var.set(f"{coord}  条件: {text}")
+
+    def _redraw_condition_board(self) -> None:
+        canvas = self.cond_canvas
+        canvas.delete("dyn")
+        for row in range(17):
+            for col in range(17):
+                if not can_hold_piece(row, col):
+                    continue
+                x0, y0, x1, y1 = self._bbox(row, col)
+                legal = self._selected is not None and (row, col) in self._legal
+                if legal:
+                    canvas.create_rectangle(
+                        x0 + 1, y0 + 1, x1 - 1, y1 - 1,
+                        fill="#C8E6C9", stipple="gray25",
+                        outline="#66BB6A", width=1, tags="dyn")
+                else:
+                    canvas.create_rectangle(
+                        x0 + 1, y0 + 1, x1 - 1, y1 - 1,
+                        fill="#BDBDBD", stipple="gray50",
+                        outline="", tags="dyn")
+        for (row, col), alternatives in self._conditions.items():
+            if not alternatives:
+                continue
+            ordered = sorted(
+                alternatives,
+                key=lambda item: (SEAT_COLORS.index(item[0]), item[1]))
+            x0, y0, x1, y1 = self._bbox(row, col)
+            canvas.create_rectangle(
+                x0 + 1, y0 + 1, x1 - 1, y1 - 1,
+                outline=COLOR_LINE[ordered[0][0]], width=1, tags="dyn")
+            if len(ordered) == 1:
+                color, piece = ordered[0]
+                canvas.create_oval(
+                    x0 + 3, y0 + 3, x1 - 3, y1 - 3,
+                    fill=COLOR_FILL[color], outline=COLOR_LINE[color], width=2,
+                    tags="dyn")
+                canvas.create_text(
+                    (x0 + x1) / 2, (y0 + y1) / 2, text=PIECE_SHORT[piece],
+                    font=("Microsoft YaHei UI", 8, "bold"),
+                    fill=COLOR_TEXT_ON[color], tags="dyn")
+                continue
+            if len(ordered) == 2:
+                cy = (y0 + y1) / 2
+                for idx, (color, piece) in enumerate(ordered):
+                    cx = x0 + 9 if idx == 0 else x1 - 9
+                    canvas.create_oval(
+                        cx - 7, cy - 7, cx + 7, cy + 7,
+                        fill=COLOR_FILL[color], outline=COLOR_LINE[color],
+                        width=1, tags="dyn")
+                    canvas.create_text(
+                        cx, cy, text=PIECE_SHORT[piece],
+                        font=("Microsoft YaHei UI", 7, "bold"),
+                        fill=COLOR_TEXT_ON[color], tags="dyn")
+                continue
+            centers = (
+                (x0 + 7, y0 + 7), (x1 - 7, y0 + 7),
+                (x0 + 7, y1 - 7), (x1 - 7, y1 - 7),
+            )
+            shown = ordered[:4]
+            for idx, (cx, cy) in enumerate(centers):
+                if idx >= len(shown):
+                    break
+                if idx == 3 and len(ordered) > 4:
+                    canvas.create_text(
+                        cx, cy, text=f"+{len(ordered) - 3}",
+                        font=("Microsoft YaHei UI", 5, "bold"),
+                        fill="#333333", tags="dyn")
+                    continue
+                color, piece = shown[idx]
+                canvas.create_oval(
+                    cx - 5, cy - 5, cx + 5, cy + 5,
+                    fill=COLOR_FILL[color], outline=COLOR_LINE[color],
+                    width=1, tags="dyn")
+                canvas.create_text(
+                    cx, cy, text=PIECE_SHORT[piece],
+                    font=("Microsoft YaHei UI", 5, "bold"),
+                    fill=COLOR_TEXT_ON[color], tags="dyn")
+
+    def _redraw_result_board(self) -> None:
+        canvas = self.result_canvas
+        canvas.delete("dyn")
+        for row in range(17):
+            for col in range(17):
+                if not can_hold_piece(row, col):
+                    continue
+                x0, y0, x1, y1 = self._bbox(row, col)
+                if (row, col) not in self._active_cells:
+                    canvas.create_rectangle(
+                        x0 + 1, y0 + 1, x1 - 1, y1 - 1,
+                        fill="#FFFFFF", stipple="gray25",
+                        outline="", tags="dyn")
+        if not self._result_counts or self._match_total <= 0:
+            for row, col in self._active_cells:
+                if not can_hold_piece(row, col):
+                    continue
+                x0, y0, x1, y1 = self._bbox(row, col)
+                canvas.create_rectangle(
+                    x0 + 1, y0 + 1, x1 - 1, y1 - 1,
+                    fill="#FFF3C4", stipple="gray25",
+                    outline="#FF6F00", width=2, tags="dyn")
+            return
+        for (row, col) in self._active_cells:
+            if not can_hold_piece(row, col):
+                continue
+            x0, y0, x1, y1 = self._bbox(row, col)
+            canvas.create_rectangle(
+                x0 + 1, y0 + 1, x1 - 1, y1 - 1,
+                fill="#FFF3C4", stipple="gray25",
+                outline="#FF6F00", width=2, tags="dyn")
+            counts = self._result_counts.get((row, col))
+            if not counts:
+                canvas.create_text(
+                    (x0 + x1) / 2, (y0 + y1) / 2, text="—",
+                    font=("Microsoft YaHei UI", 9), fill="#999999", tags="dyn")
+                continue
+            cell_total = sum(counts.values())
+            (color, piece), count = max(
+                counts.items(), key=lambda item: (item[1], item[0][0]))
+            canvas.create_text(
+                (x0 + x1) / 2, (y0 + y1) / 2 - 2,
+                text=PIECE_SHORT[piece],
+                font=("Microsoft YaHei UI", 10, "bold"),
+                fill=COLOR_TEXT[color], tags="dyn")
+            width = max(2, (self.CELL - 6) * count / cell_total)
+            canvas.create_rectangle(
+                x0 + 3, y1 - 6, x1 - 3, y1 - 2,
+                fill="#EEEEEE", outline="", tags="dyn")
+            canvas.create_rectangle(
+                x0 + 3, y1 - 6, x0 + 3 + width, y1 - 2,
+                fill=COLOR_FILL[color], outline="", tags="dyn")
+
+    def _on_result_click(self, event) -> None:
+        cell = self._cell_from_xy(event.x, event.y)
+        if cell is None or not can_hold_piece(*cell):
+            return
+        if cell in self._active_cells:
+            self._active_cells.discard(cell)
+            self.status_var.set(
+                f"已关闭结果格 {chr(65 + cell[1])}{cell[0] + 1}")
+        else:
+            self._active_cells.add(cell)
+            self.status_var.set(
+                f"已点亮结果格 {chr(65 + cell[1])}{cell[0] + 1}，"
+                f"共 {len(self._active_cells)} 格")
+        if self._stored_result is not None and self._stored_mode == "all":
+            self._result_counts = {}
+            self._match_total = 0
+            self._snapshot_total = 0
+            self._stored_result = None
+            self._stored_mode = None
+            self.status_var.set(
+                "点亮格已变化，请重新统计（全部快照模式按点亮区域去重）")
+        self._redraw_result_board()
+
+    def _on_result_motion(self, event) -> None:
+        cell = self._cell_from_xy(event.x, event.y)
+        if cell is None or not can_hold_piece(*cell):
+            self.hover_var.set("悬停已点亮格子查看前 3 名明细")
+            return
+        row, col = cell
+        coord = f"{chr(65 + col)}{row + 1}"
+        if cell not in self._active_cells:
+            self.hover_var.set(f"{coord}  未点亮（左键点亮）")
+            return
+        counts = self._result_counts.get(cell)
+        if not counts:
+            self.hover_var.set(f"{coord}  无样本")
+            return
+        cell_total = sum(counts.values())
+        top = sorted(counts.items(), key=lambda item: (-item[1], item[0][0]))[:3]
+        show_pct = self._display_mode_getter() == "百分比"
+        parts = []
+        for (color, piece), count in top:
+            if show_pct:
+                pct = count / cell_total * 100 if cell_total else 0
+                parts.append(f"{color}-{PIECE_SHORT[piece]} {pct:.1f}%")
+            else:
+                parts.append(f"{color}-{PIECE_SHORT[piece]} {count}")
+        self.hover_var.set(f"{coord}  " + "   ".join(parts))
+
+    def _result_title(self) -> str:
+        if self.first_only_var.get():
+            return "结果棋盘（首次满足时；左键点亮）"
+        return "结果棋盘（全部满足快照；连续同态去重）"
+
+    def _on_first_only_change(self) -> None:
+        self.result_frame.config(text=self._result_title())
+        self._stored_mode = None
+        if self._result_counts or self._stored_result:
+            self._result_counts = {}
+            self._match_total = 0
+            self._snapshot_total = 0
+            self._stored_result = None
+            self._stored_mode = None
+            self._redraw_result_board()
+            self.hover_var.set("悬停已点亮格子查看前 3 名明细")
+            self.status_var.set("统计模式已改变，请重新统计")
+
+    @staticmethod
+    def _conditions_match(board, conditions) -> bool:
+        for cell, alternatives in conditions.items():
+            placed = board.get(cell)
+            if placed is None:
+                return False
+            if (placed.color, placed.piece) not in alternatives:
+                return False
+        return True
+
+    def _start_stat(self) -> None:
+        folder = self._folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning("提示", "请先选择有效的文件夹", parent=self._top)
+            return
+        if not self._conditions:
+            messagebox.showwarning("提示", "请在条件棋盘上放置至少一个条件", parent=self._top)
+            return
+        if not self._active_cells:
+            messagebox.showwarning("提示", "请先在结果棋盘上左键点亮至少一个格子", parent=self._top)
+            return
+
+        self.stat_btn.config(state=tk.DISABLED)
+        self._result_counts = {}
+        self._match_total = 0
+        self._snapshot_total = 0
+        self._stored_result = None
+        self._stored_mode = None
+        self.result_frame.config(text=self._result_title())
+        self._redraw_result_board()
+        self.hover_var.set("悬停已点亮格子查看前 3 名明细")
+        self.status_var.set("统计中……")
+        self._progress_queue = queue.Queue()
+        conditions = {
+            cell: set(alternatives)
+            for cell, alternatives in self._conditions.items()
+        }
+        active_cells = tuple(sorted(self._active_cells))
+        active_set = set(active_cells)
+        first_only = bool(self.first_only_var.get())
+        mode = "first" if first_only else "all"
+
+        def worker():
+            from src.layout_stats import find_jgs_files
+            files = find_jgs_files(folder)
+            total = len(files)
+            counts: dict[tuple[int, int], dict[tuple[str, int], int]] = {}
+            match_total = 0
+            snapshot_total = 0
+            failed = 0
+            invalid = 0
+            orient_skipped = 0
+
+            def state_key(state) -> tuple:
+                values = []
+                for cell in active_cells:
+                    placed = state.get(cell)
+                    values.append(
+                        (placed.color, placed.piece) if placed else None)
+                return tuple(values)
+
+            try:
+                for index, jgs_file in enumerate(files, 1):
+                    try:
+                        replay = parse_jgs(jgs_file)
+                        if (len(replay.blocks) != 4
+                                or not all(layout_is_valid(b.matrix)
+                                           for b in replay.blocks)):
+                            invalid += 1
+                        else:
+                            times = rotation_times(replay.orient)
+                            board = normalize_board(replay.board, replay.orient)
+                            if times is None or board is None:
+                                orient_skipped += 1
+                            else:
+                                counted_here = False
+                                last_key = None
+                                for _step_no, state in iter_states(
+                                        replay, board, times):
+                                    if not self._conditions_match(state, conditions):
+                                        last_key = None
+                                        continue
+                                    if not first_only:
+                                        key = state_key(state)
+                                        if key == last_key:
+                                            continue
+                                        last_key = key
+                                    counted_here = True
+                                    snapshot_total += 1
+                                    for cell, placed in state.items():
+                                        if not can_hold_piece(*cell):
+                                            continue
+                                        if not first_only and cell not in active_set:
+                                            continue
+                                        bucket = counts.setdefault(cell, {})
+                                        key_piece = (placed.color, placed.piece)
+                                        bucket[key_piece] = bucket.get(key_piece, 0) + 1
+                                    if first_only:
+                                        break
+                                if counted_here:
+                                    match_total += 1
+                    except Exception:
+                        failed += 1
+                    self._progress_queue.put((index, total))
+                valid_total = total - invalid - failed - orient_skipped
+                missed = max(0, valid_total - match_total)
+                self._stat_result = (
+                    counts, match_total, snapshot_total, total, failed, invalid,
+                    orient_skipped, missed, mode)
+            except Exception as exc:
+                self._stat_result = (
+                    counts, match_total, snapshot_total, total, failed, invalid,
+                    orient_skipped, str(exc), mode)
+
+        self._stat_result = None
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
+        self.after(100, self._poll_worker)
+
+    def _poll_worker(self) -> None:
+        while True:
+            try:
+                done, total = self._progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.status_var.set(f"统计中…… {done}/{total}")
+
+        if self._worker is not None and self._worker.is_alive():
+            self.after(100, self._poll_worker)
+            return
+
+        self.stat_btn.config(state=tk.NORMAL)
+        result = self._stat_result
+        if result is None:
+            self.status_var.set("统计失败")
+            return
+        counts, match_total, snapshot_total, total, failed, invalid, orient_skipped, missed, mode = result
+        if isinstance(failed, str):
+            self.status_var.set(f"统计失败: {failed}")
+            messagebox.showerror("统计失败", failed, parent=self._top)
+            return
+        self._result_counts = counts
+        self._match_total = match_total
+        self._snapshot_total = snapshot_total
+        self._stored_mode = mode
+        if match_total == 0:
+            self._stored_result = None
+            self._redraw_result_board()
+            self.status_var.set(
+                f"没有复盘满足条件 (总数 {total}，未命中 {missed}，布局异常 {invalid}，"
+                f"解析失败 {failed}，方位无法归一 {orient_skipped})")
+            return
+        self._stored_result = (counts, match_total, total)
+        self._redraw_result_board()
+        valid_total = total - invalid - failed - orient_skipped
+        ratio = match_total / valid_total * 100 if valid_total else 0
+        if mode == "first":
+            self.status_var.set(
+                f"命中复盘: {match_total}/{valid_total} ({ratio:.1f}%)  "
+                f"未命中 {missed}  布局异常 {invalid}  解析失败 {failed}  "
+                f"方位无法归一 {orient_skipped}")
+        else:
+            self.status_var.set(
+                f"快照: {snapshot_total}（来自 {match_total}/{valid_total} 个复盘，"
+                f"连续同态已去重）  未命中 {missed}  布局异常 {invalid}  "
+                f"解析失败 {failed}  方位无法归一 {orient_skipped}")
+
+    def _clear_all(self) -> None:
+        self._conditions.clear()
+        self._active_cells.clear()
+        self._selected = None
+        self._legal = set()
+        self._result_counts = {}
+        self._match_total = 0
+        self._snapshot_total = 0
+        self._stored_result = None
+        self._stored_mode = None
+        for lbl in self._piece_buttons.values():
+            lbl.config(relief=tk.RAISED, bd=1, highlightthickness=0)
+        self._redraw_condition_board()
+        self._redraw_result_board()
+        self.cond_hover_var.set(
+            "旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右；悬停条件格查看格内“或”条件")
+        self.hover_var.set("悬停已点亮格子查看前 3 名明细")
+        self.status_var.set(
+            "拖拽或点击左侧棋子；可配置全盘，旗/雷限初始位；结果格需左键点亮")
+
+    def clear_stats(self) -> None:
+        self._clear_all()
+
+    def _refresh_grid(self) -> None:
+        if self._stored_result:
+            self._redraw_result_board()
+
+
+class GLReplayPanel(ttk.Frame):
+    """联众 .JQH.TXT 文本复盘完整解析：玩家、棋盘、行棋与子力统计"""
+
+    CELL = 28
+    MARGIN = 18
+    PLAYER_FILL = {
+        "blue": "#4F86C6", "red": "#D9534F",
+        "green": "#5FA85F", "gray": "#8A8A8A",
+    }
+    PLAYER_TEXT = {
+        "blue": "#FFFFFF", "red": "#FFFFFF",
+        "green": "#FFFFFF", "gray": "#FFFFFF",
+    }
+    REGION_FILL = {
+        "top": "#E3F0FA", "bottom": "#FFE6E6",
+        "left": "#E6F4E3", "right": "#EFEFEF",
+    }
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.replay = None
+        self.analysis = None
+        self.file_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="请选择联众 .JQH.TXT 文本复盘")
+        self.stats_summary_var = tk.StringVar(value="")
+        self._build_ui()
+
+    @property
+    def _top(self):
+        return self.winfo_toplevel()
+
+    @property
+    def _board_size(self) -> int:
+        return self.MARGIN * 2 + 17 * self.CELL
+
+    def _build_ui(self) -> None:
+        bar = ttk.Frame(self, padding=(0, 0, 0, 6))
+        bar.pack(fill=tk.X)
+        ttk.Button(bar, text="选择复盘...", command=self._choose_file).pack(side=tk.LEFT)
+        ttk.Label(bar, text="文件:").pack(side=tk.LEFT, padx=(6, 0))
+        entry = ttk.Entry(bar, textvariable=self.file_var, width=62)
+        entry.pack(side=tk.LEFT, padx=(4, 4), fill=tk.X, expand=True)
+        entry.bind("<Return>", lambda _e: self._parse_current())
+        ttk.Button(bar, text="清空", command=self._clear).pack(side=tk.RIGHT)
+        self.export_btn = ttk.Button(
+            bar, text="导出 JSON", command=self._export_json, state=tk.DISABLED)
+        self.export_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(bar, text="解析", command=self._parse_current).pack(side=tk.RIGHT)
+
+        ttk.Label(self, textvariable=self.status_var, padding=(2, 2, 2, 0)).pack(
+            fill=tk.X, side=tk.BOTTOM)
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        self._build_overview_tab()
+        self._build_board_tab()
+        self._build_moves_tab()
+        self._build_stats_tab()
+
+    def _build_overview_tab(self) -> None:
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="对局概览")
+        self.overview_text = tk.Text(
+            frame, wrap=tk.WORD, font=("Microsoft YaHei UI", 10),
+            state=tk.DISABLED, padx=10, pady=8)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.overview_text.yview)
+        self.overview_text.configure(yscrollcommand=scroll.set)
+        self.overview_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.overview_text.tag_configure("heading", font=("Microsoft YaHei UI", 11, "bold"))
+        self.overview_text.tag_configure("warn", foreground="#B00000")
+
+    def _build_board_tab(self) -> None:
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="初始棋盘")
+        self.board_canvas = tk.Canvas(
+            frame, width=self._board_size, height=self._board_size,
+            bg="#FFFFFF", highlightthickness=0)
+        self.board_canvas.pack(padx=8, pady=8)
+        ttk.Label(
+            frame, text="颜色：蓝=上家  红=下家  绿=左家  灰=右家",
+            padding=(8, 0, 8, 8)).pack(anchor=tk.W)
+
+    def _build_moves_tab(self) -> None:
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="行棋记录")
+        columns = ("no", "type", "start", "end", "turn", "player", "result", "detail", "time")
+        self.moves_tree = ttk.Treeview(frame, columns=columns, show="headings")
+        titles = {
+            "no": ("序号", 55), "type": ("类型", 70), "start": ("起点", 80),
+            "end": ("终点", 80), "turn": ("回合方", 70), "player": ("实际方", 70),
+            "result": ("结果", 100), "detail": ("交手", 300), "time": ("时间", 90),
+        }
+        for key, (title, width) in titles.items():
+            self.moves_tree.heading(key, text=title)
+            self.moves_tree.column(key, width=width, anchor=tk.CENTER,
+                                   stretch=(key == "detail"))
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.moves_tree.yview)
+        self.moves_tree.configure(yscrollcommand=scroll.set)
+        self.moves_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.moves_tree.tag_configure("event", background="#FFF6D8")
+        self.moves_tree.tag_configure("error", background="#FFE0E0")
+
+    def _build_stats_tab(self) -> None:
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="子力统计")
+        ttk.Label(
+            frame, textvariable=self.stats_summary_var,
+            font=("Microsoft YaHei UI", 10, "bold"), padding=(8, 8, 8, 4),
+        ).pack(fill=tk.X)
+        columns = (
+            "player", "seat", "moves", "attacks", "captures", "losses",
+            "mutual", "bomb_kills", "bomb_losses", "mine_kills", "mine_losses",
+            "gained", "lost", "net", "rating",
+        )
+        titles = {
+            "player": ("玩家", 150), "seat": ("座位", 50), "moves": ("步数", 50),
+            "attacks": ("交手", 50), "captures": ("吃子", 50), "losses": ("被吃", 50),
+            "mutual": ("同尽", 50), "bomb_kills": ("炸杀", 50),
+            "bomb_losses": ("被炸", 50), "mine_kills": ("挖雷", 50),
+            "mine_losses": ("触雷", 50), "gained": ("得分", 60),
+            "lost": ("损失", 60), "net": ("净值", 60), "rating": ("评级", 50),
+        }
+        self.stats_tree = ttk.Treeview(frame, columns=columns, show="headings")
+        for key, (title, width) in titles.items():
+            self.stats_tree.heading(key, text=title)
+            self.stats_tree.column(key, width=width, anchor=tk.CENTER,
+                                   stretch=(key == "player"))
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.stats_tree.yview)
+        self.stats_tree.configure(yscrollcommand=scroll.set)
+        self.stats_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _choose_file(self) -> None:
+        top = self._top
+        geo = top.geometry()
+        path = filedialog.askopenfilename(
+            title="选择联众文本复盘", parent=top,
+            filetypes=[("联众文本复盘", "*.TXT"), ("文本文件", "*.txt"),
+                       ("所有文件", "*.*")])
+        top.geometry(geo)
+        if path:
+            self.file_var.set(path)
+            self._parse_current()
+
+    def _parse_current(self) -> None:
+        path = self.file_var.get().strip()
+        if not path:
+            messagebox.showwarning("提示", "请先选择联众文本复盘", parent=self._top)
+            return
+        try:
+            replay = parse_glworld_text(path)
+            analysis = replay.analyze()
+        except Exception as exc:
+            self.replay = None
+            self.analysis = None
+            self.export_btn.config(state=tk.DISABLED)
+            self._refresh_overview()
+            self._refresh_board()
+            self._refresh_moves()
+            self._refresh_stats()
+            self.status_var.set(f"解析失败: {exc}")
+            messagebox.showerror("解析失败", str(exc), parent=self._top)
+            return
+        self._set_replay(replay, analysis)
+
+    def _set_replay(self, replay, analysis) -> None:
+        self.replay = replay
+        self.analysis = analysis
+        self.file_var.set(replay.path)
+        self.export_btn.config(state=tk.NORMAL)
+        self._refresh_overview()
+        self._refresh_board()
+        self._refresh_moves()
+        self._refresh_stats()
+        self.status_var.set(
+            f"解析完成: {Path(replay.path).name}  行棋 {len(replay.moves)}  "
+            f"棋子 {replay.piece_count}  胜方 "
+            f"{'、'.join(GL_COLOR_CN[c] for c in analysis.winner) or '和局'}")
+
+    def _clear(self) -> None:
+        self.replay = None
+        self.analysis = None
+        self.file_var.set("")
+        self.export_btn.config(state=tk.DISABLED)
+        self.status_var.set("请选择联众 .JQH.TXT 文本复盘")
+        self._refresh_overview()
+        self._refresh_board()
+        self._refresh_moves()
+        self._refresh_stats()
+
+    def _refresh_overview(self) -> None:
+        widget = self.overview_text
+        widget.config(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        if self.replay is None or self.analysis is None:
+            widget.config(state=tk.DISABLED)
+            return
+        replay = self.replay
+        analysis = self.analysis
+        lines = [
+            ("heading", "基础信息\n"),
+            ("", f"文件: {replay.path}\n"),
+            ("", f"行棋数: {len(replay.moves)}    棋子数: {replay.piece_count}\n"),
+            ("", f"先手方: {GL_COLOR_CN.get(replay.first_move_color, '未知')}\n"),
+        ]
+        for key, value in replay.game_info.items():
+            lines.append(("", f"{key}: {value}\n"))
+        lines.append(("heading", "\n四位玩家\n"))
+        for color in GL_COLOR_ORDER:
+            player = replay.players.get(color)
+            stats = analysis.stats.get(color)
+            if not player or not stats:
+                continue
+            lines.append((
+                "", f"{GL_COLOR_CN[color]} · {player.seat}家 · {player.name}  "
+                    f"步数 {stats.moves}  净值 {stats.net_value:+d}  评级 {stats.rating}\n"))
+        lines.append(("", f"\n结果: {'、'.join(GL_COLOR_CN[c] for c in analysis.winner) or '和局'}\n"))
+        if analysis.result.losers:
+            lines.append(("", "负方: " + "、".join(
+                GL_COLOR_CN.get(c, c) for c in analysis.result.losers) + "\n"))
+        if analysis.key_events:
+            lines.append(("heading", "\n关键事件\n"))
+            for event in analysis.key_events[:30]:
+                lines.append(("", f"第 {event['step']} 步  "
+                                  f"{event.get('category', '')}  {event.get('text', '')}\n"))
+            if len(analysis.key_events) > 30:
+                lines.append(("", f"其余 {len(analysis.key_events) - 30} 条已省略\n"))
+        for tag, text in lines:
+            widget.insert(tk.END, text, tag if tag else ())
+        widget.config(state=tk.DISABLED)
+
+    def _refresh_board(self) -> None:
+        canvas = self.board_canvas
+        canvas.delete("all")
+        if self.replay is None:
+            return
+        cell = self.CELL
+        margin = self.MARGIN
+        for row in range(17):
+            for col in range(17):
+                x0 = margin + col * cell
+                y0 = margin + row * cell
+                data = self.replay.board[row][col]
+                if data is None:
+                    canvas.create_rectangle(
+                        x0, y0, x0 + cell, y0 + cell,
+                        fill="#F7F7F7", outline="#E0E0E0")
+                    continue
+                region = self._quadrant(row, col)
+                fill = self.REGION_FILL.get(region, "#FAFAFA")
+                if data.type == "camp":
+                    fill = "#D5D5D5"
+                canvas.create_rectangle(x0, y0, x0 + cell, y0 + cell,
+                                        fill=fill, outline="#D0D0D0")
+                if data.type == "camp":
+                    canvas.create_oval(
+                        x0 + 5, y0 + 5, x0 + cell - 5, y0 + cell - 5,
+                        fill="#BFBFBF", outline="#9E9E9E")
+                elif data.type == "hq":
+                    canvas.create_rectangle(
+                        x0 + 1, y0 + 1, x0 + cell - 1, y0 + cell - 1,
+                        outline="#C62828", width=2)
+                if data.piece is not None:
+                    color = data.piece.player if data.piece.player in self.PLAYER_FILL else "gray"
+                    canvas.create_oval(
+                        x0 + 4, y0 + 4, x0 + cell - 4, y0 + cell - 4,
+                        fill=self.PLAYER_FILL[color],
+                        outline=self.PLAYER_FILL[color])
+                    canvas.create_text(
+                        x0 + cell / 2, y0 + cell / 2,
+                        text=data.piece.char,
+                        font=("Microsoft YaHei UI", 10, "bold"),
+                        fill=self.PLAYER_TEXT[color])
+        border = margin - 1
+        canvas.create_rectangle(
+            border, border, self._board_size - border, self._board_size - border,
+            outline="#8D6E63", width=2)
+        for col in range(17):
+            x = margin + col * cell + cell / 2
+            canvas.create_text(x, margin / 2, text=str(col + 1),
+                               font=("Consolas", 6), fill="#666666")
+        for row in range(17):
+            y = margin + row * cell + cell / 2
+            canvas.create_text(margin / 2, y, text=GL_ROW_LETTERS[row],
+                               font=("Consolas", 7), fill="#666666")
+
+    @staticmethod
+    def _quadrant(row: int, col: int) -> str | None:
+        if row <= 5 and 6 <= col <= 10:
+            return "top"
+        if row >= 11 and 6 <= col <= 10:
+            return "bottom"
+        if 6 <= row <= 10 and col <= 5:
+            return "left"
+        if 6 <= row <= 10 and col >= 11:
+            return "right"
+        return None
+
+    def _refresh_moves(self) -> None:
+        self._clear_tree(self.moves_tree)
+        if self.replay is None:
+            return
+        result_text = {
+            "move": "移动", "invalid": "无效", "pass": "Pass", "giveup": "GiveUp",
+            "attacker_wins": "吃子", "defender_wins": "被吃",
+            "both_die": "同尽", "flag_captured": "扛旗",
+        }
+        for move in self.replay.moves:
+            if move.kind in ("pass", "giveup"):
+                values = (move.num, move.display_type, "", "", move.turn_player or "",
+                          move.player or "", result_text.get(move.result, move.result),
+                          "", f"{move.time1}-{move.time2}")
+                self.moves_tree.insert("", tk.END, values=values, tags=("event",))
+                continue
+            detail = ""
+            if move.combat:
+                attacker = move.combat["attacker"]
+                defender = move.combat["defender"]
+                detail = (f"攻 {attacker['char']}({GL_COLOR_CN.get(attacker['player'], '?')})"
+                          f" vs 守 {defender['char']}({GL_COLOR_CN.get(defender['player'], '?')})")
+            values = (
+                move.num, move.display_type,
+                f"{move.start[0]},{move.start[1]}" if move.start else "",
+                f"{move.end[0]},{move.end[1]}" if move.end else "",
+                move.turn_player or "", move.player or "",
+                result_text.get(move.result, move.result), detail,
+                f"{move.time1}-{move.time2}",
+            )
+            tags = ("event",) if move.combat else ()
+            if move.result == "invalid":
+                tags = ("error",)
+            self.moves_tree.insert("", tk.END, values=values, tags=tags)
+        self.moves_tree.yview_moveto(0)
+
+    def _refresh_stats(self) -> None:
+        self._clear_tree(self.stats_tree)
+        if self.replay is None or self.analysis is None:
+            self.stats_summary_var.set("")
+            return
+        winners = "、".join(GL_COLOR_CN[c] for c in self.analysis.winner) or "和局"
+        self.stats_summary_var.set(f"结果: {winners}    行棋: {len(self.replay.moves)}")
+        for color in GL_COLOR_ORDER:
+            player = self.replay.players.get(color)
+            st = self.analysis.stats.get(color)
+            if not player or not st:
+                continue
+            values = (
+                f"{GL_COLOR_CN[color]} {player.name}", player.seat, st.moves,
+                st.attacks, st.captures, st.losses, st.mutual_destruct,
+                st.bomb_kills, st.bomb_losses, st.mine_kills, st.mine_losses,
+                st.value_gained, st.value_lost, st.net_value, st.rating,
+            )
+            self.stats_tree.insert("", tk.END, values=values)
+
+    @staticmethod
+    def _clear_tree(tree: ttk.Treeview) -> None:
+        for item in tree.get_children():
+            tree.delete(item)
+
+    def _export_json(self) -> None:
+        if self.replay is None:
+            return
+        top = self._top
+        geo = top.geometry()
+        path = filedialog.asksaveasfilename(
+            title="导出联众复盘解析", parent=top, defaultextension=".json",
+            initialfile=f"{Path(self.replay.path).stem}_解析.json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")])
+        top.geometry(geo)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.replay.to_dict(), f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc), parent=top)
+            return
+        messagebox.showinfo("完成", f"已导出: {path}", parent=top)
+
+
 class StatsGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -3681,13 +4784,13 @@ class StatsGUI:
                 self.direction_var.set("逆时针")
 
         # 显示/隐藏平台专属tabs
-        # QQ专属 tabs (index 1, 3, 9)
-        for i in (1, 3, 9):
+        # QQ专属 tabs (index 1, 3, 9, 10)
+        for i in (1, 3, 9, 10):
             self.notebook.tab(i, state="hidden" if is_lianzhong else "normal")
         # 主视角 tab (index 2) 始终隐藏
         self.notebook.tab(2, state="hidden")
-        # 联众专属 tabs (index 4, 5, 6)
-        for i in (4, 5, 6):
+        # 联众专属 tabs (index 4, 5, 6, 11)
+        for i in (4, 5, 6, 11):
             self.notebook.tab(i, state="normal" if is_lianzhong else "hidden")
         # 公共 tabs 始终显示 (0=棋子维度, 7=按布阵筛选, 8=条件概率)
         for i in (0, 7, 8):
@@ -3698,15 +4801,21 @@ class StatsGUI:
         # 1.2 联众->QQ，且当前是"颜色统计"(index=4)或"先手方视角"(index=5) -> 切换到"QQ颜色(兼座次)统计"(index=1)
         # 1.3 QQ->联众，且当前是"QQ号码统计"(index=3) -> 切换到"联众ID统计"(index=6)
         # 1.4 联众->QQ，且当前是"联众ID统计"(index=6) -> 切换到"QQ号码统计"(index=3)
+        # 1.5 QQ->联众，且当前是QQ复盘解析/批量统计(9/10) -> 切换到"联众复盘解析"(index=11)
+        # 1.6 联众->QQ，且当前是"联众复盘解析"(index=11) -> 切换到QQ复盘解析(index=9)
         # 其它情况: 如果当前tab被隐藏，跳到棋子维度统计(0)
         if is_lianzhong and current_idx == 1:
             target_idx = 4
         elif is_lianzhong and current_idx == 3:
             target_idx = 6
+        elif is_lianzhong and current_idx in (9, 10):
+            target_idx = 11
         elif not is_lianzhong and current_idx in (4, 5):
             target_idx = 1
         elif not is_lianzhong and current_idx == 6:
             target_idx = 3
+        elif not is_lianzhong and current_idx == 11:
+            target_idx = 9
         else:
             # 检查当前tab是否仍然可见
             try:
@@ -3731,7 +4840,8 @@ class StatsGUI:
         """清空所有面板的统计结果"""
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
-                     self.layout_filter_panel, self.conditional_panel):
+                     self.layout_filter_panel, self.conditional_panel,
+                     self.qq_batch_panel):
             panel.clear_stats()
 
     def _on_direction_change(self) -> None:
@@ -3747,7 +4857,8 @@ class StatsGUI:
         """切换百分比/数量显示模式"""
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
-                     self.layout_filter_panel, self.conditional_panel):
+                     self.layout_filter_panel, self.conditional_panel,
+                     self.qq_batch_panel):
             panel._refresh_grid()
 
     def _on_dedup_change(self) -> None:
@@ -3832,6 +4943,16 @@ class StatsGUI:
         # QQ复盘完整解析 (index=9, 仅QQ)
         self.qq_replay_panel = QQReplayPanel(self.notebook)
         self.notebook.add(self.qq_replay_panel, text="QQ复盘解析")
+
+        # QQ复盘批量统计 (index=10, 仅QQ)
+        self.qq_batch_panel = QQBatchPanel(
+            self.notebook, self.folder_var, display_mode_getter=display_mode_getter)
+        self.notebook.add(self.qq_batch_panel, text="QQ复盘批量统计")
+
+        # 联众复盘完整解析 (index=11, 仅联众)
+        self.gl_replay_panel = GLReplayPanel(self.notebook)
+        self.notebook.add(self.gl_replay_panel, text="联众复盘解析")
+        self.notebook.tab(11, state="hidden")
 
         # QQ/联众选项卡对应关系 (用于切换平台时保持位置)
         self._qq_to_lz_tab = {1: 4, 3: 6}  # QQ index -> 联众 index
