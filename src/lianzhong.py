@@ -842,6 +842,307 @@ def analyze_jqh_game(raw: bytes) -> dict:
     }
 
 
+# ============================================================
+# 联众 .JQH 通用引擎: 状态迭代 / 司令军长轨迹 / 空炸筛选
+# ============================================================
+
+# 座位映射: 联众固定视角(蓝上/绿左/红下/黑右) -> QQ 规范色(黄上/紫左/绿下/蓝右)
+JQH_BLOCK_TO_QQ = {"蓝": "黄", "绿": "紫", "红": "绿", "黑": "蓝"}
+JQH_BLOCK_SEAT = {"蓝": "上", "绿": "左", "红": "下", "黑": "右"}
+
+# "最大仅吃到连长"允许的击杀棋子(与 QQ 侧一致)
+JQH_SMALL_KILL_PIECES = ("连长", "排长", "工兵")
+
+_JQH_NAME_FULL = {
+    "司": "司令", "军": "军长", "师": "师长", "旅": "旅长",
+    "团": "团长", "营": "营长", "连": "连长", "排": "排长",
+    "兵": "工兵", "弹": "炸弹", "雷": "地雷", "旗": "军旗",
+}
+
+
+def _jqh_replay_walk(raw: bytes):
+    """联众 .jqh 推演核心, 依次产出 (步号, board, ev)。
+
+    board: {(r,c): (块色, 棋子字)}, 每步更新(对象复用, 消费方立即读取);
+    ev: None(初始) 或 dict:
+        {'kind':'move', 'start','end','attacker','target','result'}
+        {'kind':'pass'} / {'kind':'giveup','color'}
+      其中 attacker/target 为 (块色,棋子字) 或 None; result ∈
+        move/attacker_wins/defender_wins/both_die/flag_captured/error;
+      'cleared': [(块色, 原因)] 记录本步被清子的玩家(认输/连跳判负/扛旗)。
+    轮转方向按开局行棋颜色拟合; 开局 Pass/GiveUp 各占一轮;
+    连续两次未行棋判负清子; 扛旗清除被扛方全部子。
+    """
+    from .glworld_replay import _resolve_combat
+
+    board = dict(jqh_global_pieces(raw))
+    _, moves_raw = parse_jqh_moves_raw(raw)
+    fn = _JQH_MOVE_TRANSFORMS[_JQH_PIECES_TRANSFORM]
+
+    part = {v[0] for v in board.values()}
+    cycle = [c for c in _JQH_TURN_CYCLE if c in part] or list(_JQH_TURN_CYCLE)
+
+    # 轮转方向拟合: 取开局若干手的行棋颜色, 看相邻转换更贴合哪个走向
+    probe: list[str] = []
+    b2 = dict(board)
+    for m in moves_raw:
+        if isinstance(m, str):
+            if probe:
+                break
+            continue
+        s = fn(m[0], m[1])
+        e = fn(m[2], m[3])
+        p = b2.get(s)
+        if p is None:
+            continue
+        probe.append(p[0])
+        b2.pop(s, None)
+        tgt = b2.get(e)
+        if tgt is not None and tgt[0] != p[0]:
+            res = _resolve_combat(p[1], tgt[1])
+            if res in ("attacker_wins", "flag_captured"):
+                b2[e] = p
+            elif res == "both_die":
+                b2.pop(e, None)
+        else:
+            b2[e] = p
+        if len(probe) >= 8:
+            break
+    fwd = rev = 0
+    for a, b in zip(probe, probe[1:]):
+        if a not in cycle or b not in cycle:
+            continue
+        i = cycle.index(a)
+        if cycle[(i + 1) % len(cycle)] == b:
+            fwd += 1
+        if cycle[(i - 1) % len(cycle)] == b:
+            rev += 1
+    if rev > fwd:
+        cycle = [cycle[0]] + cycle[1:][::-1]
+
+    # 开局哨兵各占一轮, 起始偏移回退
+    lead = 0
+    first_src = None
+    for m in moves_raw:
+        if isinstance(m, str):
+            lead += 1
+            continue
+        first_src = board.get(fn(m[0], m[1]))
+        break
+    offset = 0
+    if first_src is not None and first_src[0] in cycle:
+        offset = (cycle.index(first_src[0]) - lead) % len(cycle)
+
+    idx = offset
+    active = set(cycle)
+    skip = {c: 0 for c in cycle}
+    last_mover = None
+
+    def next_turn():
+        nonlocal idx
+        for _ in range(len(cycle) + 1):
+            c = cycle[idx % len(cycle)]
+            idx += 1
+            if c in active:
+                return c
+        return None
+
+    def clear_color(color, cause, cleared):
+        if color in active:
+            active.discard(color)
+            cleared.append((color, cause))
+        for k in [k for k, v in board.items() if v[0] == color]:
+            del board[k]
+
+    yield 0, board, None
+    mover = next_turn()
+    for no, m in enumerate(moves_raw, 1):
+        cleared = []
+        if isinstance(m, str):
+            if m == "GiveUp":
+                if mover is not None:
+                    clear_color(mover, "认输", cleared)
+                mover = next_turn()
+                ev = {"kind": "giveup", "color": None, "cleared": cleared}
+            else:
+                if mover is not None:
+                    skip[mover] = 0
+                    last_mover = mover
+                mover = next_turn()
+                ev = {"kind": "pass", "cleared": cleared}
+            yield no, board, ev
+            continue
+
+        # 连跳判负
+        if last_mover is not None and mover is not None:
+            i0 = cycle.index(last_mover)
+            for step in range(1, len(cycle)):
+                c = cycle[(i0 + step) % len(cycle)]
+                if c == mover:
+                    break
+                if c in active:
+                    skip[c] += 1
+                    if skip[c] >= 2:
+                        clear_color(c, "超时判负", cleared)
+        if mover is not None:
+            skip[mover] = 0
+        last_mover = mover if mover is not None else last_mover
+
+        s = fn(m[0], m[1])
+        e = fn(m[2], m[3])
+        attacker = board.get(s)
+        target = board.get(e)
+        ev = {"kind": "move", "start": s, "end": e,
+              "attacker": attacker, "target": target,
+              "result": "error", "cleared": cleared}
+        if attacker is None:
+            ev["result"] = "error"
+        elif target is not None and target[0] == attacker[0]:
+            ev["result"] = "error"
+        elif target is None:
+            del board[s]
+            board[e] = attacker
+            ev["result"] = "move"
+        else:
+            res = _resolve_combat(attacker[1], target[1])
+            ev["result"] = res
+            del board[s]
+            if res == "attacker_wins":
+                board[e] = attacker
+            elif res == "both_die":
+                board.pop(e, None)
+            elif res == "defender_wins":
+                pass
+            elif res == "flag_captured":
+                board[e] = attacker
+                clear_color(target[0], "被扛旗", cleared)
+        mover = next_turn()
+        yield no, board, ev
+
+
+def iter_jqh_states(raw: bytes):
+    """按行棋顺序推演全局状态, 依次产出 (步号, 状态dict)。
+
+    首个产出为初始布阵(步号0), 之后每步产出一次; 含认输/扛旗/连跳判负清子。
+    状态 dict: {(r,c): (QQ规范色, ItemType)}; 消费方应立即读取, 勿保存引用。
+    """
+    c2i = get_char_to_itemtype()
+    for no, board, _ev in _jqh_replay_walk(raw):
+        yield no, {
+            pos: (JQH_BLOCK_TO_QQ[col], c2i[ch])
+            for pos, (col, ch) in board.items()
+        }
+
+
+def trace_jqh_heroes(raw: bytes) -> list[dict]:
+    """追踪四家司令/军长轨迹(联众 .jqh)。
+
+    返回 dict 列表: block(块色)/seat/player/name/kills/death_step/
+    death_kind/death_by_bomb。击杀含主动吃子与被撞反吃; 被炸弹炸死 =
+    与敌方炸弹同尽。阵亡方式: 被炸弹炸死/被吃/同尽/触雷/清子。
+    """
+    heroes: list[dict] = []
+    hero_at: dict[tuple[int, int], dict] = {}
+    names = decode_jqh_all_usernames(raw)
+    block_name_idx = {"红": 0, "绿": 1, "蓝": 2, "黑": 3}
+
+    def die(h, step, kind, by_bomb):
+        h["death_step"] = step
+        h["death_kind"] = kind
+        h["death_by_bomb"] = by_bomb
+
+    for no, board, ev in _jqh_replay_walk(raw):
+        if no == 0:
+            for pos, (col, ch) in board.items():
+                if ch in ("司", "军"):
+                    h = {
+                        "block": col, "seat": JQH_BLOCK_SEAT[col],
+                        "player": names[block_name_idx[col]],
+                        "name": _JQH_NAME_FULL[ch], "char": ch, "pos": pos,
+                        "kills": [], "death_step": None,
+                        "death_kind": "在场", "death_by_bomb": False,
+                    }
+                    heroes.append(h)
+                    hero_at[pos] = h
+            continue
+        for color, cause in ev.get("cleared", ()):
+            for h in heroes:
+                if h["block"] == color and h["death_kind"] == "在场":
+                    die(h, no, "清子", False)
+        if ev["kind"] != "move":
+            continue
+        atk = hero_at.get(ev["start"])
+        dfn = hero_at.get(ev["end"])
+        res = ev["result"]
+        a_name = _JQH_NAME_FULL.get(ev["attacker"][1], "?") if ev["attacker"] else ""
+        d_name = _JQH_NAME_FULL.get(ev["target"][1], "?") if ev["target"] else ""
+        if res == "move":
+            if atk:
+                hero_at.pop(ev["start"], None)
+                atk["pos"] = ev["end"]
+                hero_at[ev["end"]] = atk
+        elif res == "attacker_wins":
+            if atk:
+                atk["kills"].append(d_name)
+                hero_at.pop(ev["start"], None)
+                atk["pos"] = ev["end"]
+                hero_at[ev["end"]] = atk
+            if dfn:
+                die(dfn, no, "被吃", False)
+        elif res == "defender_wins":
+            if atk:
+                if d_name == "地雷":
+                    die(atk, no, "触雷", False)
+                else:
+                    die(atk, no, "被吃", False)
+                hero_at.pop(ev["start"], None)
+            if dfn:
+                dfn["kills"].append(a_name)
+        elif res == "both_die":
+            if atk:
+                die(atk, no, "被炸弹炸死" if d_name == "炸弹" else "同尽",
+                    d_name == "炸弹")
+                hero_at.pop(ev["start"], None)
+            if dfn:
+                die(dfn, no, "被炸弹炸死" if a_name == "炸弹" else "同尽",
+                    a_name == "炸弹")
+        elif res == "flag_captured":
+            if atk:
+                hero_at.pop(ev["start"], None)
+                atk["pos"] = ev["end"]
+                hero_at[ev["end"]] = atk
+    return heroes
+
+
+def find_jqh_empty_bomb_victims(raw: bytes, mode: str = "none") -> list[dict]:
+    """空炸筛选(联众 .jqh): 司令/军长被对手炸弹换掉且击杀记录满足条件。
+
+    mode="none":     什么都没吃;
+    mode="max_lian": 最大仅吃到连长(连/排/工, 含什么都没吃)。
+    返回字段与 QQ 版 find_empty_bomb_victims 一致。
+    """
+    out = []
+    for h in trace_jqh_heroes(raw):
+        if not h["death_by_bomb"]:
+            continue
+        if mode == "none":
+            if h["kills"]:
+                continue
+        elif any(name not in JQH_SMALL_KILL_PIECES for name in h["kills"]):
+            continue
+        out.append({
+            "color": h["block"],
+            "seat": h["seat"],
+            "player": h["player"],
+            "piece": h["name"],
+            "kills": list(h["kills"]),
+            "death_step": h["death_step"],
+            "death_kind": h["death_kind"],
+            "empty": not h["kills"],
+        })
+    return out
+
+
 class LianzhongReplay:
     """联众四国军棋复盘解析（布阵读取初版）。"""
 

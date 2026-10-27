@@ -4316,9 +4316,10 @@ class QQBatchPanel(ttk.Frame):
 class QQQuickFilterPanel(ttk.Frame):
     """QQ 复盘常用模式一键筛选（当前第一套：司令/军长被空炸复盘筛选）"""
 
-    def __init__(self, parent, folder_var: tk.StringVar):
+    def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar):
         super().__init__(parent, padding=2)
         self._folder_var = folder_var
+        self._source_var = source_var
         self._worker = None
         self._scan_result = None
         self.mode_var = tk.StringVar(value="none")
@@ -4353,7 +4354,7 @@ class QQQuickFilterPanel(ttk.Frame):
             top,
             text="追踪四家司令/军长的全局吃子记录（含反吃），凡被对手炸弹换掉"
                  "且满足所选条件即命中；“最大仅吃到连长”指击杀仅限连长/排长/工兵"
-                 "（含什么都没吃）。",
+                 "（含什么都没吃）。复盘范围随全局平台选择（QQ .jgs / 联众 .jqh）。",
             wraplength=760).pack(fill=tk.X, padx=6, pady=(0, 4))
 
         result = ttk.LabelFrame(self, text="命中结果（每行一条：某家司令/军长）")
@@ -4389,25 +4390,40 @@ class QQQuickFilterPanel(ttk.Frame):
         self.scan_btn.config(state=tk.DISABLED)
         self.status_var.set("统计中……")
         mode = self.mode_var.get()
+        is_lianzhong = self._source_var.get() == "联众"
         progress = [0]
         total_ref = [0]
 
         def worker():
             try:
-                from src.layout_stats import find_jgs_files
-                from src.qq_replay import find_empty_bomb_victims
-                files = find_jgs_files(folder)
-                total_ref[0] = len(files)
                 rows = []
                 failed = 0
-                for jgs_file in files:
-                    try:
-                        rep = parse_jgs(jgs_file)
-                        for rec in find_empty_bomb_victims(rep, mode):
-                            rows.append((os.path.basename(jgs_file), rec))
-                    except Exception:
-                        failed += 1
-                    progress[0] += 1
+                if is_lianzhong:
+                    from src.lianzhong import find_jqh_empty_bomb_victims
+                    files = sorted(glob.glob(
+                        os.path.join(folder, "**", "*.jqh"), recursive=True))
+                    total_ref[0] = len(files)
+                    for jqh_file in files:
+                        try:
+                            raw = open(jqh_file, "rb").read()
+                            for rec in find_jqh_empty_bomb_victims(raw, mode):
+                                rows.append((os.path.basename(jqh_file), rec))
+                        except Exception:
+                            failed += 1
+                        progress[0] += 1
+                else:
+                    from src.layout_stats import find_jgs_files
+                    from src.qq_replay import find_empty_bomb_victims
+                    files = find_jgs_files(folder)
+                    total_ref[0] = len(files)
+                    for jgs_file in files:
+                        try:
+                            rep = parse_jgs(jgs_file)
+                            for rec in find_empty_bomb_victims(rep, mode):
+                                rows.append((os.path.basename(jgs_file), rec))
+                        except Exception:
+                            failed += 1
+                        progress[0] += 1
                 self._scan_result = (rows, total_ref[0], failed, mode, None)
             except Exception as e:
                 self._scan_result = ([], 0, 0, mode, str(e))
@@ -4454,7 +4470,9 @@ class QQQuickFilterPanel(ttk.Frame):
                 kills, rec["death_step"], verdict))
 
         mode_text = "什么都没吃" if mode == "none" else "最大仅吃到连长"
-        status = (f"模式[{mode_text}] 扫描 {total} 局，命中 {len(hit_files)} 局"
+        platform_text = "联众" if self._source_var.get() == "联众" else "QQ"
+        status = (f"范围[{platform_text}] 模式[{mode_text}] 扫描 {total} 局，"
+                  f"命中 {len(hit_files)} 局"
                   f" / {len(rows)} 条记录（什么都没吃 {n_empty} 条 ·"
                   f"最大仅吃到连长 {len(rows) - n_empty} 条）")
         if failed:
@@ -4466,6 +4484,138 @@ class QQQuickFilterPanel(ttk.Frame):
             self.tree.delete(*self.tree.get_children())
         self.status_var.set("选择文件夹后点击筛选按钮；四家中任一家命中即计入该局")
         self._scan_result = None
+
+
+class GeneralFilterPanel(QQBatchPanel):
+    """通用筛选条件统计: 条件棋盘/结果棋盘统计, QQ(.jgs) 与联众(.jqh) 双平台。
+    思路参考 QQ复盘批量统计(QQBatchPanel) + 联众复盘解析(lianzhong):
+    条件与交互完全复用 QQ 面板, 复盘范围由全局 平台 radio 切换。
+    条件色为 QQ 规范色(黄上/紫左/绿下/蓝右), 联众复盘按同座位映射
+    (蓝上/绿左/红下/黑右) 套用同一条件。
+    """
+
+    def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar,
+                 display_mode_getter=None):
+        super().__init__(parent, folder_var, display_mode_getter)
+        self._source_var = source_var
+        self.cond_hover_var.set(
+            "旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右"
+            "（联众同座位：蓝上/绿左/红下/黑右）；悬停条件格查看格内“或”条件")
+        self.status_var.set(
+            "拖拽或点击左侧棋子；可配置全盘，旗/雷限初始位；结果格需左键点亮")
+
+    def _start_stat(self) -> None:
+        if self._source_var.get() != "联众":
+            super()._start_stat()
+            return
+        folder = self._folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning("提示", "请先选择有效的文件夹", parent=self._top)
+            return
+        if not self._conditions:
+            messagebox.showwarning("提示", "请在条件棋盘上放置至少一个条件", parent=self._top)
+            return
+        if not self._active_cells:
+            messagebox.showwarning("提示", "请先在结果棋盘上左键点亮至少一个格子", parent=self._top)
+            return
+
+        self.stat_btn.config(state=tk.DISABLED)
+        self._result_counts = {}
+        self._match_total = 0
+        self._snapshot_total = 0
+        self._stored_result = None
+        self._stored_mode = None
+        self.result_frame.config(text=self._result_title())
+        self._redraw_result_board()
+        self.hover_var.set("悬停已点亮格子查看前 3 名明细")
+        self.status_var.set("统计中……")
+        self._progress_queue = queue.Queue()
+        conditions = {
+            cell: set(alternatives)
+            for cell, alternatives in self._conditions.items()
+        }
+        active_cells = tuple(sorted(self._active_cells))
+        active_set = set(active_cells)
+        first_only = bool(self.first_only_var.get())
+        mode = "first" if first_only else "all"
+
+        def worker():
+            from src.lianzhong import iter_jqh_states
+            files = sorted(glob.glob(
+                os.path.join(folder, "**", "*.jqh"), recursive=True))
+            total = len(files)
+            counts: dict[tuple[int, int], dict[tuple[str, int], int]] = {}
+            match_total = 0
+            snapshot_total = 0
+            failed = 0
+            invalid = 0
+
+            def state_key(state) -> tuple:
+                values = []
+                for cell in active_cells:
+                    placed = state.get(cell)
+                    values.append((placed[0], placed[1]) if placed else None)
+                return tuple(values)
+
+            def conditions_match(state) -> bool:
+                for cell, alternatives in conditions.items():
+                    placed = state.get(cell)
+                    if placed is None or (placed[0], placed[1]) not in alternatives:
+                        return False
+                return True
+
+            try:
+                for index, jqh_file in enumerate(files, 1):
+                    try:
+                        raw = open(jqh_file, "rb").read()
+                        counted_here = False
+                        last_key = None
+                        is_initial = True
+                        for _step_no, state in iter_jqh_states(raw):
+                            if is_initial:
+                                is_initial = False
+                                if len(state) != 100:
+                                    invalid += 1
+                                    break
+                            if not conditions_match(state):
+                                last_key = None
+                                continue
+                            if not first_only:
+                                key = state_key(state)
+                                if key == last_key:
+                                    continue
+                                last_key = key
+                            counted_here = True
+                            snapshot_total += 1
+                            for cell, placed in state.items():
+                                if not can_hold_piece(*cell):
+                                    continue
+                                if not first_only and cell not in active_set:
+                                    continue
+                                bucket = counts.setdefault(cell, {})
+                                key_piece = (placed[0], placed[1])
+                                bucket[key_piece] = bucket.get(key_piece, 0) + 1
+                            if first_only:
+                                break
+                        if counted_here:
+                            match_total += 1
+                    except Exception:
+                        failed += 1
+                    self._progress_queue.put((index, total))
+                valid_total = total - invalid - failed
+                missed = max(0, valid_total - match_total)
+                self._stat_result = (
+                    counts, match_total, snapshot_total, total, failed, invalid,
+                    0, missed, mode)
+            except Exception as exc:
+                self._stat_result = (
+                    counts, match_total, snapshot_total, total, str(exc),
+                    invalid, 0, 0, mode)
+
+        self._stat_result = None
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
+        self.after(100, self._poll_worker)
 
 
 class GLReplayPanel(ttk.Frame):
@@ -4939,16 +5089,16 @@ class StatsGUI:
                 self.direction_var.set("逆时针")
 
         # 显示/隐藏平台专属tabs
-        # QQ专属 tabs (index 1, 3, 9, 10, 11)
-        for i in (1, 3, 9, 10, 11):
+        # QQ专属 tabs (index 1, 3, 9, 10)
+        for i in (1, 3, 9, 10):
             self.notebook.tab(i, state="hidden" if is_lianzhong else "normal")
         # 主视角 tab (index 2) 始终隐藏
         self.notebook.tab(2, state="hidden")
-        # 联众专属 tabs (index 4, 5, 6, 12)
-        for i in (4, 5, 6, 12):
+        # 联众专属 tabs (index 4, 5, 6, 13)
+        for i in (4, 5, 6, 13):
             self.notebook.tab(i, state="normal" if is_lianzhong else "hidden")
-        # 公共 tabs 始终显示 (0=棋子维度, 7=按布阵筛选, 8=条件概率)
-        for i in (0, 7, 8):
+        # 公共 tabs 始终显示 (0=棋子维度, 7=按布阵筛选, 8=条件概率, 11=一键筛选, 12=通用条件统计)
+        for i in (0, 7, 8, 11, 12):
             self.notebook.tab(i, state="normal")
 
         # 选项卡跳转逻辑:
@@ -4956,20 +5106,20 @@ class StatsGUI:
         # 1.2 联众->QQ，且当前是"颜色统计"(index=4)或"先手方视角"(index=5) -> 切换到"QQ颜色(兼座次)统计"(index=1)
         # 1.3 QQ->联众，且当前是"QQ号码统计"(index=3) -> 切换到"联众ID统计"(index=6)
         # 1.4 联众->QQ，且当前是"联众ID统计"(index=6) -> 切换到"QQ号码统计"(index=3)
-        # 1.5 QQ->联众，且当前是QQ复盘解析/批量统计/一键筛选(9/10/11) -> 切换到"联众复盘解析"(index=12)
-        # 1.6 联众->QQ，且当前是"联众复盘解析"(index=12) -> 切换到QQ复盘解析(index=9)
+        # 1.5 QQ->联众，且当前是QQ复盘解析/批量统计(9/10) -> 切换到"联众复盘解析"(index=13)
+        # 1.6 联众->QQ，且当前是"联众复盘解析"(index=13) -> 切换到QQ复盘解析(index=9)
         # 其它情况: 如果当前tab被隐藏，跳到棋子维度统计(0)
         if is_lianzhong and current_idx == 1:
             target_idx = 4
         elif is_lianzhong and current_idx == 3:
             target_idx = 6
-        elif is_lianzhong and current_idx in (9, 10, 11):
-            target_idx = 12
+        elif is_lianzhong and current_idx in (9, 10):
+            target_idx = 13
         elif not is_lianzhong and current_idx in (4, 5):
             target_idx = 1
         elif not is_lianzhong and current_idx == 6:
             target_idx = 3
-        elif not is_lianzhong and current_idx == 12:
+        elif not is_lianzhong and current_idx == 13:
             target_idx = 9
         else:
             # 检查当前tab是否仍然可见
@@ -4996,7 +5146,7 @@ class StatsGUI:
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
                      self.layout_filter_panel, self.conditional_panel,
-                     self.qq_batch_panel, self.qq_quick_panel):
+                     self.qq_batch_panel, self.qq_quick_panel, self.general_panel):
             panel.clear_stats()
 
     def _on_direction_change(self) -> None:
@@ -5013,7 +5163,7 @@ class StatsGUI:
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
                      self.layout_filter_panel, self.conditional_panel,
-                     self.qq_batch_panel):
+                     self.qq_batch_panel, self.general_panel):
             panel._refresh_grid()
 
     def _on_dedup_change(self) -> None:
@@ -5104,14 +5254,21 @@ class StatsGUI:
             self.notebook, self.folder_var, display_mode_getter=display_mode_getter)
         self.notebook.add(self.qq_batch_panel, text="QQ复盘批量统计")
 
-        # 常用模式一键筛选 (index=11, 仅QQ)
-        self.qq_quick_panel = QQQuickFilterPanel(self.notebook, self.folder_var)
+        # 常用模式一键筛选 (index=11, 双平台, 复用全局平台 radio)
+        self.qq_quick_panel = QQQuickFilterPanel(
+            self.notebook, self.folder_var, self.source_var)
         self.notebook.add(self.qq_quick_panel, text="常用模式一键筛选")
 
-        # 联众复盘完整解析 (index=12, 仅联众)
+        # 通用筛选条件统计 (index=12, 双平台, 复用全局平台 radio)
+        self.general_panel = GeneralFilterPanel(
+            self.notebook, self.folder_var, self.source_var,
+            display_mode_getter=display_mode_getter)
+        self.notebook.add(self.general_panel, text="通用筛选条件统计")
+
+        # 联众复盘完整解析 (index=13, 仅联众)
         self.gl_replay_panel = GLReplayPanel(self.notebook)
         self.notebook.add(self.gl_replay_panel, text="联众复盘解析")
-        self.notebook.tab(12, state="hidden")
+        self.notebook.tab(13, state="hidden")
 
         # QQ/联众选项卡对应关系 (用于切换平台时保持位置)
         self._qq_to_lz_tab = {1: 4, 3: 6}  # QQ index -> 联众 index
