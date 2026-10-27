@@ -1073,6 +1073,159 @@ def _analyze(replay: QQReplay) -> ReplayAnalysis:
     )
 
 
+# ============================================================
+# 司令/军长 轨迹追踪与"空炸"筛选
+# ============================================================
+
+# "最大仅吃到连长"允许的击杀棋子
+SMALL_KILL_PIECES = ("连长", "排长", "工兵")
+
+
+@dataclass
+class HeroTrace:
+    """单个司令/军长的全局轨迹: 击杀记录与阵亡方式。"""
+    color: str
+    piece: int
+    pos: tuple[int, int] | None
+    kills: list[str] = field(default_factory=list)
+    death_step: int | None = None
+    death_kind: str = "在场"
+    killer_color: str = ""
+    death_by_bomb: bool = False
+
+    @property
+    def name(self) -> str:
+        return PIECE_NAMES.get(self.piece, "?")
+
+
+def trace_heroes(replay: QQReplay) -> list[HeroTrace]:
+    """追踪四家司令/军长: 逐手记录其击杀过的敌子与最终阵亡方式。
+
+    击杀记录同时计入主动吃子与被撞反吃; 阵亡方式含
+    被炸弹炸死(撞敌炸弹或被敌炸弹撞, 同尽)/被吃/同尽/触雷/清子(判负等)。
+    """
+    board = dict(replay.board)
+    heroes: list[HeroTrace] = []
+    for pos, p in board.items():
+        if p.piece in (int(ItemType.Silin), int(ItemType.Junzhang)):
+            heroes.append(HeroTrace(color=p.color, piece=p.piece, pos=pos))
+
+    alive = {color: True for color in COLOR_ORDER}
+    defeated_at: dict[str, int] = {}
+    skip_count = {color: 0 for color in COLOR_ORDER}
+    turn_idx = len(replay.turn_order) - 1
+
+    def hero_at(pos):
+        for h in heroes:
+            if h.pos == pos and h.death_kind == "在场":
+                return h
+        return None
+
+    def sync() -> None:
+        for h in heroes:
+            if h.death_kind != "在场" or h.pos is None:
+                continue
+            p = board.get(h.pos)
+            if p is None or p.color != h.color or p.piece != h.piece:
+                h.death_kind = "清子"
+
+    def die(h: HeroTrace, step: int, kind: str, by_bomb: bool, killer: str) -> None:
+        h.death_step = step
+        h.death_kind = kind
+        h.death_by_bomb = by_bomb
+        h.killer_color = killer
+
+    sync()
+    for kind, item in replay.seq:
+        if kind == "event":
+            event = item
+            color = event.color
+            is_timeout = event.code == 2
+            is_defeat = (event.code == 2 and event.b >= 5) or event.code in (3, 4)
+            if is_defeat and color and alive.get(color):
+                alive[color] = False
+                defeated_at[color] = event.no
+                _remove_all(board, color)
+            if is_timeout and color in replay.turn_order:
+                turn_idx = replay.turn_order.index(color)
+                skip_count[color] = 0
+            sync()
+            continue
+
+        move = item
+        if alive.get(move.color):
+            _check_defeat_before_move(board, move.color, alive, defeated_at, move.no)
+        turn_idx = _track_turn_skip(
+            move, move.no, replay.turn_order, alive, defeated_at,
+            skip_count, turn_idx, board)
+        sync()
+
+        atk = hero_at(move.start)
+        dfn = hero_at(move.end)
+        resolved = resolve_move(move, board)
+        rt = resolved.type
+        a_name = (PIECE_NAMES.get(resolved.from_piece, "?")
+                  if resolved.from_piece is not None else "")
+        d_name = (PIECE_NAMES.get(resolved.def_piece, "?")
+                  if resolved.def_piece is not None else "")
+
+        if rt == "eat":
+            if atk:
+                atk.kills.append(d_name)
+                atk.pos = move.end
+            if dfn:
+                die(dfn, move.no, "被吃", False, move.color)
+        elif rt == "killed":
+            if atk:
+                die(atk, move.no, "被吃", False, resolved.defender or "")
+            if dfn:
+                dfn.kills.append(a_name)
+        elif rt == "both":
+            if atk:
+                die(atk, move.no, "被炸弹炸死" if d_name == "炸弹" else "同尽",
+                    d_name == "炸弹", resolved.defender or "")
+            if dfn:
+                die(dfn, move.no, "被炸弹炸死" if a_name == "炸弹" else "同尽",
+                    a_name == "炸弹", move.color)
+        elif rt == "mine":
+            if atk:
+                die(atk, move.no, "触雷", False, resolved.defender or "")
+        elif rt in ("move", "dig", "flag"):
+            if atk:
+                atk.pos = move.end
+        sync()
+    return heroes
+
+
+def find_empty_bomb_victims(replay: QQReplay, mode: str = "none") -> list[dict]:
+    """空炸筛选: 司令/军长被对手炸弹换掉且击杀记录满足条件的记录。
+
+    mode="none":     什么都没吃;
+    mode="max_lian": 最大仅吃到连长(连/排/工, 含什么都没吃)。
+    一局可返回多条(四家中多家命中); 一家都不命中则返回空列表。
+    """
+    out = []
+    for h in trace_heroes(replay):
+        if not h.death_by_bomb:
+            continue
+        if mode == "none":
+            if h.kills:
+                continue
+        elif any(name not in SMALL_KILL_PIECES for name in h.kills):
+            continue
+        out.append({
+            "color": h.color,
+            "seat": DIR_CN.get(replay.orient.get(h.color, ""), ""),
+            "player": replay.players.get(h.color, ""),
+            "piece": h.name,
+            "kills": list(h.kills),
+            "death_step": h.death_step,
+            "death_kind": h.death_kind,
+            "empty": not h.kills,
+        })
+    return out
+
+
 def _to_text(replay: QQReplay, analysis: ReplayAnalysis) -> str:
     lines = [
         "QQ四国军棋复盘 v2.0",

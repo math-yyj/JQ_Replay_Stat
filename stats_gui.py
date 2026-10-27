@@ -4313,6 +4313,161 @@ class QQBatchPanel(ttk.Frame):
             self._redraw_result_board()
 
 
+class QQQuickFilterPanel(ttk.Frame):
+    """QQ 复盘常用模式一键筛选（当前第一套：司令/军长被空炸复盘筛选）"""
+
+    def __init__(self, parent, folder_var: tk.StringVar):
+        super().__init__(parent, padding=2)
+        self._folder_var = folder_var
+        self._worker = None
+        self._scan_result = None
+        self.mode_var = tk.StringVar(value="none")
+        self.status_var = tk.StringVar(
+            value="选择文件夹后点击筛选按钮；四家中任一家命中即计入该局")
+        self._build_ui()
+
+    @property
+    def _top(self):
+        return self.winfo_toplevel()
+
+    def _build_ui(self) -> None:
+        top = ttk.LabelFrame(self, text="第一套 · 司令/军长被空炸复盘筛选")
+        top.pack(fill=tk.X, padx=2, pady=(0, 4))
+
+        row = ttk.Frame(top)
+        row.pack(fill=tk.X, padx=6, pady=(4, 2))
+        ttk.Label(row, text="命中条件:").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            row, text="什么都没吃", value="none",
+            variable=self.mode_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Radiobutton(
+            row, text="最大仅吃到连长", value="max_lian",
+            variable=self.mode_var).pack(side=tk.LEFT, padx=(12, 0))
+        self.scan_btn = ttk.Button(
+            row, text="司令/军长被空炸复盘筛选", command=self._start_scan)
+        self.scan_btn.pack(side=tk.LEFT, padx=(18, 0))
+        ttk.Button(row, text="清空结果", command=self.clear_stats).pack(
+            side=tk.LEFT, padx=(6, 0))
+
+        ttk.Label(
+            top,
+            text="追踪四家司令/军长的全局吃子记录（含反吃），凡被对手炸弹换掉"
+                 "且满足所选条件即命中；“最大仅吃到连长”指击杀仅限连长/排长/工兵"
+                 "（含什么都没吃）。",
+            wraplength=760).pack(fill=tk.X, padx=6, pady=(0, 4))
+
+        result = ttk.LabelFrame(self, text="命中结果（每行一条：某家司令/军长）")
+        result.pack(fill=tk.BOTH, expand=True, padx=2)
+
+        cols = ("file", "seat", "player", "piece", "kills", "step", "verdict")
+        heads = ("文件", "方位", "玩家", "棋子", "击杀记录", "阵亡步", "判定")
+        widths = (230, 50, 150, 60, 175, 70, 310)
+        style = ttk.Style(self)
+        style.configure("Quick.Treeview", font=("Microsoft YaHei UI", 9),
+                        rowheight=24)
+        style.configure("Quick.Treeview.Heading",
+                        font=("Microsoft YaHei UI", 9, "bold"))
+        self.tree = ttk.Treeview(
+            result, columns=cols, show="headings", height=14,
+            style="Quick.Treeview")
+        for col, head, width in zip(cols, heads, widths):
+            self.tree.heading(col, text=head)
+            self.tree.column(col, width=width, anchor="w", stretch=(col == "file"))
+        vsb = ttk.Scrollbar(result, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0), pady=4)
+        vsb.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4), pady=4)
+
+        ttk.Label(self, textvariable=self.status_var).pack(
+            fill=tk.X, pady=(2, 0))
+
+    def _start_scan(self) -> None:
+        folder = self._folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning("提示", "请先选择有效的文件夹", parent=self._top)
+            return
+        self.scan_btn.config(state=tk.DISABLED)
+        self.status_var.set("统计中……")
+        mode = self.mode_var.get()
+        progress = [0]
+        total_ref = [0]
+
+        def worker():
+            try:
+                from src.layout_stats import find_jgs_files
+                from src.qq_replay import find_empty_bomb_victims
+                files = find_jgs_files(folder)
+                total_ref[0] = len(files)
+                rows = []
+                failed = 0
+                for jgs_file in files:
+                    try:
+                        rep = parse_jgs(jgs_file)
+                        for rec in find_empty_bomb_victims(rep, mode):
+                            rows.append((os.path.basename(jgs_file), rec))
+                    except Exception:
+                        failed += 1
+                    progress[0] += 1
+                self._scan_result = (rows, total_ref[0], failed, mode, None)
+            except Exception as e:
+                self._scan_result = ([], 0, 0, mode, str(e))
+
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
+        self._progress_timer = self.after(
+            200, self._update_progress, progress, total_ref)
+        self.after(100, self._poll_worker)
+
+    def _update_progress(self, progress, total_ref) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            self.status_var.set(f"统计中…… {progress[0]}/{total_ref[0]}")
+            self._progress_timer = self.after(
+                200, self._update_progress, progress, total_ref)
+
+    def _poll_worker(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            self.after(100, self._poll_worker)
+            return
+        if not hasattr(self, "scan_btn") or not self.scan_btn.winfo_exists():
+            return
+        self.scan_btn.config(state=tk.NORMAL)
+        if self._scan_result is None:
+            return
+        rows, total, failed, mode, err = self._scan_result
+        if err:
+            self.status_var.set(f"统计失败: {err}")
+            messagebox.showerror("错误", err, parent=self._top)
+            return
+
+        self.tree.delete(*self.tree.get_children())
+        hit_files = set()
+        n_empty = 0
+        for filename, rec in rows:
+            hit_files.add(filename)
+            if rec["empty"]:
+                n_empty += 1
+            kills = "、".join(rec["kills"]) if rec["kills"] else "（无）"
+            verdict = ("空炸司令/军长（什么都没吃）" if rec["empty"]
+                       else "空炸司令/军长（最大仅吃到连长）")
+            self.tree.insert("", tk.END, values=(
+                filename, rec["seat"], rec["player"], rec["piece"],
+                kills, rec["death_step"], verdict))
+
+        mode_text = "什么都没吃" if mode == "none" else "最大仅吃到连长"
+        status = (f"模式[{mode_text}] 扫描 {total} 局，命中 {len(hit_files)} 局"
+                  f" / {len(rows)} 条记录（什么都没吃 {n_empty} 条 ·"
+                  f"最大仅吃到连长 {len(rows) - n_empty} 条）")
+        if failed:
+            status += f"；解析失败 {failed} 个"
+        self.status_var.set(status)
+
+    def clear_stats(self) -> None:
+        if hasattr(self, "tree") and self.tree.winfo_exists():
+            self.tree.delete(*self.tree.get_children())
+        self.status_var.set("选择文件夹后点击筛选按钮；四家中任一家命中即计入该局")
+        self._scan_result = None
+
+
 class GLReplayPanel(ttk.Frame):
     """联众 .JQH.TXT 文本复盘完整解析：玩家、棋盘、行棋与子力统计"""
 
@@ -4784,13 +4939,13 @@ class StatsGUI:
                 self.direction_var.set("逆时针")
 
         # 显示/隐藏平台专属tabs
-        # QQ专属 tabs (index 1, 3, 9, 10)
-        for i in (1, 3, 9, 10):
+        # QQ专属 tabs (index 1, 3, 9, 10, 11)
+        for i in (1, 3, 9, 10, 11):
             self.notebook.tab(i, state="hidden" if is_lianzhong else "normal")
         # 主视角 tab (index 2) 始终隐藏
         self.notebook.tab(2, state="hidden")
-        # 联众专属 tabs (index 4, 5, 6, 11)
-        for i in (4, 5, 6, 11):
+        # 联众专属 tabs (index 4, 5, 6, 12)
+        for i in (4, 5, 6, 12):
             self.notebook.tab(i, state="normal" if is_lianzhong else "hidden")
         # 公共 tabs 始终显示 (0=棋子维度, 7=按布阵筛选, 8=条件概率)
         for i in (0, 7, 8):
@@ -4801,20 +4956,20 @@ class StatsGUI:
         # 1.2 联众->QQ，且当前是"颜色统计"(index=4)或"先手方视角"(index=5) -> 切换到"QQ颜色(兼座次)统计"(index=1)
         # 1.3 QQ->联众，且当前是"QQ号码统计"(index=3) -> 切换到"联众ID统计"(index=6)
         # 1.4 联众->QQ，且当前是"联众ID统计"(index=6) -> 切换到"QQ号码统计"(index=3)
-        # 1.5 QQ->联众，且当前是QQ复盘解析/批量统计(9/10) -> 切换到"联众复盘解析"(index=11)
-        # 1.6 联众->QQ，且当前是"联众复盘解析"(index=11) -> 切换到QQ复盘解析(index=9)
+        # 1.5 QQ->联众，且当前是QQ复盘解析/批量统计/一键筛选(9/10/11) -> 切换到"联众复盘解析"(index=12)
+        # 1.6 联众->QQ，且当前是"联众复盘解析"(index=12) -> 切换到QQ复盘解析(index=9)
         # 其它情况: 如果当前tab被隐藏，跳到棋子维度统计(0)
         if is_lianzhong and current_idx == 1:
             target_idx = 4
         elif is_lianzhong and current_idx == 3:
             target_idx = 6
-        elif is_lianzhong and current_idx in (9, 10):
-            target_idx = 11
+        elif is_lianzhong and current_idx in (9, 10, 11):
+            target_idx = 12
         elif not is_lianzhong and current_idx in (4, 5):
             target_idx = 1
         elif not is_lianzhong and current_idx == 6:
             target_idx = 3
-        elif not is_lianzhong and current_idx == 11:
+        elif not is_lianzhong and current_idx == 12:
             target_idx = 9
         else:
             # 检查当前tab是否仍然可见
@@ -4841,7 +4996,7 @@ class StatsGUI:
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
                      self.layout_filter_panel, self.conditional_panel,
-                     self.qq_batch_panel):
+                     self.qq_batch_panel, self.qq_quick_panel):
             panel.clear_stats()
 
     def _on_direction_change(self) -> None:
@@ -4949,10 +5104,14 @@ class StatsGUI:
             self.notebook, self.folder_var, display_mode_getter=display_mode_getter)
         self.notebook.add(self.qq_batch_panel, text="QQ复盘批量统计")
 
-        # 联众复盘完整解析 (index=11, 仅联众)
+        # 常用模式一键筛选 (index=11, 仅QQ)
+        self.qq_quick_panel = QQQuickFilterPanel(self.notebook, self.folder_var)
+        self.notebook.add(self.qq_quick_panel, text="常用模式一键筛选")
+
+        # 联众复盘完整解析 (index=12, 仅联众)
         self.gl_replay_panel = GLReplayPanel(self.notebook)
         self.notebook.add(self.gl_replay_panel, text="联众复盘解析")
-        self.notebook.tab(11, state="hidden")
+        self.notebook.tab(12, state="hidden")
 
         # QQ/联众选项卡对应关系 (用于切换平台时保持位置)
         self._qq_to_lz_tab = {1: 4, 3: 6}  # QQ index -> 联众 index
