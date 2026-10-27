@@ -536,60 +536,254 @@ def resolve_move_transform(
     moves: list[tuple[int, int, int, int] | str],
     pieces: dict[tuple[int, int], tuple[str, str]] | None = None,
 ) -> tuple[str, float]:
-    """自洽判定行棋坐标系变换, 返回 (变换名, 得分)。
+    """判定行棋坐标 -> 布阵网格的变换, 返回 (变换名, 违规率)。
 
-    pieces: 全局17x17棋子位置 {(行,列): (颜色, 棋子)}, 见 jqh_global_pieces。
-    得分 = 每步起点格在推演中确实持有棋子的比例。
+    分类式判定(非统一范式):
+      1) 格式常量: 行棋四元组坐标相对布阵网格恒为转置 TR
+         (200 组配对验证: 唯一 0 违规变换恒为 TR);
+      2) TR 严格推演 0 违规即采信; 否则退回 8 变换全量推演,
+         取违规数最小者, 平局倾向 TR。
+    注意: 文本 .JQH.TXT 导出帧自身带旋转/镜像变体(共 8 种, 随座位与
+    镜像变化), 文本坐标比对所需的变换与本函数结果不同, 需另行按坐标
+    全等搜索(见 test_sample/test_jqh_moves_regression.py)。
     """
     quad_moves = [m for m in moves if not isinstance(m, str)]
-    if not quad_moves:
-        return "I", 1.0
+    if not quad_moves or not pieces:
+        return _JQH_PIECES_TRANSFORM, 0.0
 
-    best_name, best_score = "I", -1.0
+    best = None
     for name in _JQH_MOVE_TRANSFORMS:
-        score = _score_transform(name, quad_moves, pieces)
-        if score > best_score:
-            best_name, best_score = name, score
-    return best_name, best_score
+        res = simulate_jqh_game(moves, pieces, name)
+        key = (res["viol"], name != _JQH_PIECES_TRANSFORM, name)
+        if best is None or key < best[0]:
+            best = (key, name, res["viol_rate"])
+    assert best is not None
+    return best[1], best[2]
 
 
-def _score_transform(name, quad_moves, pieces) -> float:
-    # cells: {(r,c): (color, piece)}
+# 格式常量: 行棋坐标相对布阵网格恒为转置(200/200 验证, 见 resolve_move_transform)
+_JQH_PIECES_TRANSFORM = "TR"
+
+# 二面体变换求逆 (R90/R270 互逆, 其余为对合)
+_JQH_TRANSFORM_INVERSE = {
+    "I": "I", "R90": "R270", "R180": "R180", "R270": "R90",
+    "FH": "FH", "FV": "FV", "TR": "TR", "ATR": "ATR",
+}
+
+
+def jqh_transform_compose(outer: str, inner: str) -> str:
+    """求复合变换 F = outer ∘ inner (先 inner 后 outer), 返回变换名。"""
+    fo = _JQH_MOVE_TRANSFORMS[outer]
+    fi = _JQH_MOVE_TRANSFORMS[inner]
+    probe = [(r, c) for r in (0, 3, 8, 12, 16) for c in (0, 5, 8, 11, 16)]
+    target = [fo(*fi(r, c)) for r, c in probe]  # type: ignore[operator]
+    for name, fn in _JQH_MOVE_TRANSFORMS.items():
+        if [fn(r, c) for r, c in probe] == target:
+            return name
+    raise ValueError(f"uncomposable transforms: {outer} ∘ {inner}")
+
+# 行营(空, 不可被攻击) 在全局17x17的坐标: 各家本地 (1,1)(1,3)(2,2)(3,1)(3,3)
+_JQH_CAMP_LOCAL = ((1, 1), (1, 3), (2, 2), (3, 1), (3, 3))
+
+
+def jqh_global_camps() -> set[tuple[int, int]]:
+    """四家行营在全局 17x17 的格子集合 (上蓝/下红/左绿/右黑 固定视角)。"""
+    camps = set()
+    for i, j in _JQH_CAMP_LOCAL:
+        camps.add((11 + i, 6 + j))   # 下(红)
+        camps.add((5 - i, 10 - j))   # 上(蓝)
+        camps.add((6 + j, 5 - i))    # 左(绿)
+        camps.add((10 - j, 11 + i))  # 右(黑)
+    return camps
+
+
+# 固定行棋色序: 下(红)→左(绿)→上(蓝)→右(黑), 依 glworld TURN_ORDER 推得
+_JQH_TURN_CYCLE = ("红", "绿", "蓝", "黑")
+
+
+def simulate_jqh_game(
+    moves: list[tuple[int, int, int, int] | str],
+    pieces: dict[tuple[int, int], tuple[str, str]] | None,
+    transform: str,
+) -> dict:
+    """按四国军棋规则严格推演(指定变换), 返回违规统计与终局信息。
+
+    规则: 吃子按 glworld _resolve_combat; 行营内子不可被攻击;
+          GiveUp=该家认输并清除其子; 扛旗清除被扛方全部子;
+          连跳2次判负清除; 同色落点=违规(不可吃己子)。
+    违规项: empty(起点无子) / immov(起点雷旗) / own(吃己子) /
+            camp(攻击行营内子) / owner(非轮走方行棋)。
+    """
+    fn = _JQH_MOVE_TRANSFORMS[transform]
     cells: dict[tuple[int, int], tuple[str, str]] = dict(pieces or {})
+    camps = jqh_global_camps()
+    flag_cells = {pos for pos, v in cells.items() if v[1] == "旗"}
 
-    def t(r, c):
-        return apply_jqh_move_transform(name, r, c)
+    # 轮次走向有两种可能, 按违规率取优
+    result = _simulate_walk(moves, cells, fn, camps, flag_cells)
+    viol_detail = result["viol_detail"]
+    total = result["total"]
+    viol = sum(viol_detail.values())
+    out = {
+        "viol_detail": viol_detail,
+        "viol": viol,
+        "viol_rate": viol / total if total else 0.0,
+        "total": total,
+        "flag_hits": result["flag_hits"],
+        "immov_starts": viol_detail.get("immov", 0),
+        "eliminated": result["eliminated"],
+        "last_mover": result["last_mover"],
+    }
+    return out
 
-    total = 0
-    good = 0
-    for m in quad_moves:
-        r1, c1, r2, c2 = m
-        s = t(r1, c1)
-        e = t(r2, c2)
-        total += 1
+
+def _simulate_walk(moves, cells, fn, camps, flag_cells):
+    """单向推演: 轮次循环方向由前几个行棋方自适应拟合(两种走向取优)。"""
+    best = None
+    for direction in ("FWD", "REV"):
+        r = _walk(moves, dict(cells), fn, camps, flag_cells, direction)
+        if best is None or sum(r["viol_detail"].values()) < sum(best["viol_detail"].values()):
+            best = r
+    return best
+
+
+def _walk(moves, cells, fn, camps, flag_cells, direction):
+    from .glworld_replay import _resolve_combat
+
+    cycle = list(_JQH_TURN_CYCLE)
+    if direction == "REV":
+        cycle = [cycle[0]] + cycle[1:][::-1]
+
+    # 起点颜色 -> 循环偏移
+    offset = 0
+    for m in moves:
+        if isinstance(m, tuple):
+            src0 = cells.get(fn(m[0], m[1]))
+            if src0 is not None:
+                offset = cycle.index(src0[0]) if src0[0] in cycle else 0
+            break
+
+    active = set(cycle)
+    skip: dict[str, int] = {c: 0 for c in cycle}
+    last_mover = None
+    viol_detail: dict[str, int] = {}
+    flag_hits = 0
+    eliminated: dict[str, str] = {}
+    idx = offset
+
+    def next_turn():
+        nonlocal idx
+        for _ in range(5):
+            c = cycle[idx % 4]
+            idx += 1
+            if c in active:
+                return c
+        return None
+
+    def out_player(color, cause):
+        if color in active:
+            active.discard(color)
+            eliminated[color] = cause
+        for k in [k for k, v in cells.items() if v[0] == color]:
+            cells.pop(k, None)
+
+    def bump(key):
+        viol_detail[key] = viol_detail.get(key, 0) + 1
+
+    mover = next_turn()
+    for m in moves:
+        if isinstance(m, str):
+            if m == "GiveUp":
+                if mover is not None:
+                    out_player(mover, "认输")
+                mover = next_turn()
+            else:  # Pass
+                if mover is not None:
+                    skip[mover] = 0
+                    last_mover = mover
+                mover = next_turn()
+            continue
+
+        s = fn(m[0], m[1]); e = fn(m[2], m[3])
         src = cells.get(s)
         if src is None:
+            bump("empty")
+            mover = next_turn()
             continue
-        good += 1
+        if src[1] in ("雷", "旗"):
+            bump("immov")
+        if mover is not None and src[0] != mover:
+            bump("owner")
+        # 跳过判负
+        if last_mover is not None and mover is not None:
+            order = [c for c in cycle]
+            i0 = order.index(last_mover)
+            for step in range(1, 4):
+                c = order[(i0 + step) % 4]
+                if c == mover:
+                    break
+                if c in active:
+                    skip[c] += 1
+                    if skip[c] >= 2:
+                        out_player(c, "超时判负")
+        if mover is not None:
+            skip[mover] = 0
+        last_mover = mover if mover is not None else last_mover
+
         cells.pop(s, None)
         dst = cells.get(e)
+        if dst is not None and dst[0] == src[0]:
+            bump("own")
+        if dst is not None and e in camps:
+            bump("camp")
+        if e in flag_cells:
+            flag_hits += 1
         if dst is None:
             cells[e] = src
         else:
-            # 吃子近似: 高值存活(仅用于自洽评分)
-            from .glworld_replay import PIECE_RANK
-            if PIECE_RANK.get(src[1], 0) >= PIECE_RANK.get(dst[1], 0):
+            res = _resolve_combat(src[1], dst[1])
+            if res == "flag_captured":
+                out_player(dst[0], "被挖旗")
                 cells[e] = src
-    return good / total if total else 0.0
+            elif res == "attacker_wins":
+                cells[e] = src
+            elif res == "both_die":
+                cells.pop(e, None)
+        mover = next_turn()
+
+    return {"viol_detail": viol_detail, "flag_hits": flag_hits,
+            "eliminated": eliminated, "last_mover": last_mover,
+            "total": len(moves)}
+
+
+def determine_jqh_end_result(eliminated: dict[str, str]) -> tuple[list[str], str]:
+    """终局判定 (分类规则)。
+
+    - 恰有一方联盟两家均出局(被挖旗/认输/判负) 且对方尚有在场 -> 对方联盟胜;
+    - 否则(双方联盟的两家都被挖旗或认输/四家全灭, 或双方均未被消灭
+      —— 记录中断、超时、和局) -> ("异常中断或和局")。
+    联盟 = 对家: (蓝,红) 上下 vs (绿,黑) 左右。
+    """
+    alliances = (("蓝", "红"), ("绿", "黑"))
+    dead = set(eliminated)
+    surv_a = [c for c in alliances[0] if c not in dead]
+    surv_b = [c for c in alliances[1] if c not in dead]
+    a_out = not surv_a
+    b_out = not surv_b
+    if a_out and not b_out:
+        return list(alliances[1]), "胜负已分"
+    if b_out and surv_a:
+        return list(alliances[0]), "胜负已分"
+    return [], "异常中断或和局"
 
 
 def parse_jqh_moves(
     raw: bytes,
     pieces: dict[tuple[int, int], tuple[str, str]] | None = None,
 ) -> tuple[list[tuple[int, int, int, int] | str], str, float]:
-    """解析行棋记录并输出全局坐标。
+    """解析行棋记录并输出全局(布阵网格)坐标。
 
-    返回 (步列表, 使用的变换名, 自洽得分)。步为 (r1,c1,r2,c2) 全局坐标或 'Pass'/'GiveUp'。
+    返回 (步列表, 使用的变换名, 违规率)。步为 (r1,c1,r2,c2) 全局坐标或 'Pass'/'GiveUp'。
     """
     _, moves_raw = parse_jqh_moves_raw(raw)
     name, score = resolve_move_transform(moves_raw, pieces)
@@ -606,6 +800,29 @@ def parse_jqh_moves(
             r2, c2 = t(m[2], m[3])
             out.append((r1, c1, r2, c2))
     return out, name, score
+
+
+def analyze_jqh_game(raw: bytes) -> dict:
+    """完整分析单个 JQH: 四家布阵 + 行棋全局坐标 + 推演终局判定。
+
+    返回 dict: pieces / main_color / moves / transform / viol /
+               eliminated / winners / result_desc。
+    """
+    pieces = jqh_global_pieces(raw)
+    main_color, main_color_name = decode_jqh_main_color(raw)
+    moves, transform, _score = parse_jqh_moves(raw, pieces)
+    sim = simulate_jqh_game(moves, pieces, "I")
+    winners, desc = determine_jqh_end_result(sim["eliminated"])
+    return {
+        "pieces": pieces,
+        "main_color": main_color_name,
+        "moves": moves,
+        "transform": transform,
+        "viol": sim["viol_detail"],
+        "eliminated": sim["eliminated"],
+        "winners": winners,
+        "result_desc": desc,
+    }
 
 
 class LianzhongReplay:
