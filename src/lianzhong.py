@@ -455,6 +455,159 @@ def find_zero_gap(raw: bytes, start: int = 0x64) -> tuple[int, int]:
     return best if best else (len(raw), len(raw))
 
 
+# ============================================================
+# 联众 .JQH 行棋区解码（已完全破解并用200组配对验证）
+# ============================================================
+#
+# 编码: 行棋区自 0xC8 起延续用户信息区的 XOR 累积链, 初始 prev = raw[0xC7]（不归零）:
+#   plain[i] = ((raw[i] ^ 0x13) - prev) & 0xFF,  prev = raw[i]
+# 结构(链式解码后):
+#   偏移0: 4字节小端 = 行棋步数 N（含 Pass/GiveUp）
+#   偏移4: N × 4字节 = (起点行, 起点列, 终点行, 终点列), 行列均0基
+# 哨兵: FE FE FE FE = GiveUp,  FF FF FF FF = Pass
+# 坐标系: 解码坐标为"录制者视角"帧, 每文件是8种二面体变换之一的常量变换,
+#         需按自洽判定解析(见 resolve_move_transform), 之后得到17×17全局坐标。
+
+JQH_MOVE_START = 0xC8
+JQH_CHAIN_PREV_OFFSET = 0xC7
+JQH_CHAIN_XOR_KEY = 0x13
+
+JQH_MOVE_GIVEUP = (0xFE,) * 4
+JQH_MOVE_PASS = (0xFF,) * 4
+
+
+def decode_jqh_move_region(raw: bytes) -> bytes:
+    """链式解码行棋区(0xC8 起至文件尾), prev 从 raw[0xC7] 连续, 不归零。"""
+    out = bytearray()
+    prev = raw[JQH_CHAIN_PREV_OFFSET]
+    for i in range(JQH_MOVE_START, len(raw)):
+        out.append(((raw[i] ^ JQH_CHAIN_XOR_KEY) - prev) & 0xFF)
+        prev = raw[i]
+    return bytes(out)
+
+
+def parse_jqh_moves_raw(raw: bytes) -> tuple[int, list[tuple[int, int, int, int] | str]]:
+    """解析行棋区, 返回 (步数, 步列表)。
+
+    每步为坐标四元组 (r1, c1, r2, c2)(录制者视角帧) 或 'Pass'/'GiveUp'。
+    """
+    dec = decode_jqh_move_region(raw)
+    if len(dec) < 4:
+        raise ValueError("jqh move region too short")
+    count = int.from_bytes(dec[0:4], "little")
+    moves: list[tuple[int, int, int, int] | str] = []
+    for k in range(count):
+        off = 4 + 4 * k
+        quad = tuple(dec[off:off + 4])
+        if len(quad) < 4:
+            break
+        if quad == JQH_MOVE_GIVEUP:
+            moves.append("GiveUp")
+        elif quad == JQH_MOVE_PASS:
+            moves.append("Pass")
+        else:
+            moves.append(quad)  # type: ignore[arg-type]
+    return count, moves
+
+
+# 8种二面体变换 (行,列) -> (行,列); 坐标域 0..16
+_JQH_MOVE_TRANSFORMS: dict[str, object] = {
+    "I":    lambda r, c: (r, c),
+    "R90":  lambda r, c: (c, 16 - r),
+    "R180": lambda r, c: (16 - r, 16 - c),
+    "R270": lambda r, c: (16 - c, r),
+    "FH":   lambda r, c: (r, 16 - c),
+    "FV":   lambda r, c: (16 - r, c),
+    "TR":   lambda r, c: (c, r),
+    "ATR":  lambda r, c: (16 - c, 16 - r),
+}
+
+
+def jqh_transform_names() -> list[str]:
+    return list(_JQH_MOVE_TRANSFORMS)
+
+
+def apply_jqh_move_transform(name: str, r: int, c: int) -> tuple[int, int]:
+    fn = _JQH_MOVE_TRANSFORMS[name]  # type: ignore[assignment]
+    return fn(r, c)  # type: ignore[operator]
+
+
+def resolve_move_transform(
+    moves: list[tuple[int, int, int, int] | str],
+    pieces: dict[tuple[int, int], tuple[str, str]] | None = None,
+) -> tuple[str, float]:
+    """自洽判定行棋坐标系变换, 返回 (变换名, 得分)。
+
+    pieces: 全局17x17棋子位置 {(行,列): (颜色, 棋子)}, 见 jqh_global_pieces。
+    得分 = 每步起点格在推演中确实持有棋子的比例。
+    """
+    quad_moves = [m for m in moves if not isinstance(m, str)]
+    if not quad_moves:
+        return "I", 1.0
+
+    best_name, best_score = "I", -1.0
+    for name in _JQH_MOVE_TRANSFORMS:
+        score = _score_transform(name, quad_moves, pieces)
+        if score > best_score:
+            best_name, best_score = name, score
+    return best_name, best_score
+
+
+def _score_transform(name, quad_moves, pieces) -> float:
+    # cells: {(r,c): (color, piece)}
+    cells: dict[tuple[int, int], tuple[str, str]] = dict(pieces or {})
+
+    def t(r, c):
+        return apply_jqh_move_transform(name, r, c)
+
+    total = 0
+    good = 0
+    for m in quad_moves:
+        r1, c1, r2, c2 = m
+        s = t(r1, c1)
+        e = t(r2, c2)
+        total += 1
+        src = cells.get(s)
+        if src is None:
+            continue
+        good += 1
+        cells.pop(s, None)
+        dst = cells.get(e)
+        if dst is None:
+            cells[e] = src
+        else:
+            # 吃子近似: 高值存活(仅用于自洽评分)
+            from .glworld_replay import PIECE_RANK
+            if PIECE_RANK.get(src[1], 0) >= PIECE_RANK.get(dst[1], 0):
+                cells[e] = src
+    return good / total if total else 0.0
+
+
+def parse_jqh_moves(
+    raw: bytes,
+    pieces: dict[tuple[int, int], tuple[str, str]] | None = None,
+) -> tuple[list[tuple[int, int, int, int] | str], str, float]:
+    """解析行棋记录并输出全局坐标。
+
+    返回 (步列表, 使用的变换名, 自洽得分)。步为 (r1,c1,r2,c2) 全局坐标或 'Pass'/'GiveUp'。
+    """
+    _, moves_raw = parse_jqh_moves_raw(raw)
+    name, score = resolve_move_transform(moves_raw, pieces)
+
+    def t(r, c):
+        return apply_jqh_move_transform(name, r, c)
+
+    out: list[tuple[int, int, int, int] | str] = []
+    for m in moves_raw:
+        if isinstance(m, str):
+            out.append(m)
+        else:
+            r1, c1 = t(m[0], m[1])
+            r2, c2 = t(m[2], m[3])
+            out.append((r1, c1, r2, c2))
+    return out, name, score
+
+
 class LianzhongReplay:
     """联众四国军棋复盘解析（布阵读取初版）。"""
 
@@ -509,11 +662,11 @@ class LianzhongReplay:
         return boards if boards else None
 
 
-def decode_jqh_all_boards(raw: bytes) -> dict[str, list[list[str]]]:
-    """用完整解码逻辑(棋子位置识别+四色累积delta)解析 JQH 文件, 返回四家 6x5 布阵。
+def jqh_global_pieces(raw: bytes) -> dict[tuple[int, int], tuple[str, str]]:
+    """解析 JQH 文件全部棋子的全局 17×17 位置。
 
-    与 parse_jqh_color_board 不同, 本函数使用 chess_board_diff_process 的 17×17 棋盘
-    位置识别, 正确处理绿/蓝/黑方在棋盘不同区域的数据。
+    返回 {(行,列): (颜色, 棋子)}; 使用 chess_board_diff_process 的位置识别
+    + 四色累积 delta 解码(同 decode_jqh_all_boards 的核心)。
     """
     import sys
     _parent = os.path.join(os.path.dirname(__file__), "..")
@@ -525,7 +678,6 @@ def decode_jqh_all_boards(raw: bytes) -> dict[str, list[list[str]]]:
     is_piece = classify_groups(groups)
     seed_b1 = groups[0][1]
 
-    # 收集所有棋子位置
     piece_positions = []
     for i in range(1, len(is_piece)):
         if is_piece[i]:
@@ -534,7 +686,6 @@ def decode_jqh_all_boards(raw: bytes) -> dict[str, list[list[str]]]:
             col = gi % GRID_SIZE
             piece_positions.append((i, row, col))
 
-    # 累积 delta 解码 (zip 方式)
     COLORS = ['红', '绿', '蓝']
     _BLACK_XOR_K_LIST = {
         0x0C: [0x2B, 0x13], 0x10: [0x2B], 0x12: [0x2B],
@@ -560,7 +711,6 @@ def decode_jqh_all_boards(raw: bytes) -> dict[str, list[list[str]]]:
                     return b1, (row, col), ('黑', JQS_CODE_MAP.get(code, '?'))
         return b1, (row, col), ('?', '?')
 
-    # 构建 (prev_b1, gi, row, col) 序列, 用 zip 取相邻对
     prev_list = [seed_b1] + [groups[gi][1] for gi, _, _ in piece_positions[:-1]]
     gi_list = [gi for gi, _, _ in piece_positions]
     row_list = [r for _, r, _ in piece_positions]
@@ -569,11 +719,21 @@ def decode_jqh_all_boards(raw: bytes) -> dict[str, list[list[str]]]:
     results = [_decode_piece(p, g, r, c)
                for p, g, r, c in zip(prev_list, gi_list, row_list, col_list)]
 
-    decoded = {}
+    decoded: dict[tuple[int, int], tuple[str, str]] = {}
     for _, (row, col), (color, piece) in results:
         if piece == '空' or piece == '?':
             continue
         decoded[(row, col)] = (color, piece)
+    return decoded
+
+
+def decode_jqh_all_boards(raw: bytes) -> dict[str, list[list[str]]]:
+    """用完整解码逻辑(棋子位置识别+四色累积delta)解析 JQH 文件, 返回四家 6x5 布阵。
+
+    与 parse_jqh_color_board 不同, 本函数使用 chess_board_diff_process 的 17×17 棋盘
+    位置识别, 正确处理绿/蓝/黑方在棋盘不同区域的数据。
+    """
+    decoded = jqh_global_pieces(raw)
 
     # 提取四家子方阵(同时提取棋子名和颜色)
     def extract_subgrid(row_range, col_range):
