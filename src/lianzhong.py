@@ -650,18 +650,24 @@ def _simulate_walk(moves, cells, fn, camps, flag_cells):
 def _walk(moves, cells, fn, camps, flag_cells, direction):
     from .glworld_replay import _resolve_combat
 
-    cycle = list(_JQH_TURN_CYCLE)
+    # 分类: 按参与颜色数定轮转(四人对局4家轮转, 二人对局2家交替)
+    part = {v[0] for v in cells.values()}
+    cycle = [c for c in _JQH_TURN_CYCLE if c in part] or list(_JQH_TURN_CYCLE)
     if direction == "REV":
         cycle = [cycle[0]] + cycle[1:][::-1]
 
-    # 起点颜色 -> 循环偏移
-    offset = 0
+    # 起点颜色 -> 循环偏移; 开局的 Pass/GiveUp 各占一轮, 须回退相应轮数
+    lead = 0
+    first_src = None
     for m in moves:
-        if isinstance(m, tuple):
-            src0 = cells.get(fn(m[0], m[1]))
-            if src0 is not None:
-                offset = cycle.index(src0[0]) if src0[0] in cycle else 0
-            break
+        if isinstance(m, str):
+            lead += 1
+            continue
+        first_src = cells.get(fn(m[0], m[1]))
+        break
+    offset = 0
+    if first_src is not None and first_src[0] in cycle:
+        offset = (cycle.index(first_src[0]) - lead) % len(cycle)
 
     active = set(cycle)
     skip: dict[str, int] = {c: 0 for c in cycle}
@@ -673,8 +679,8 @@ def _walk(moves, cells, fn, camps, flag_cells, direction):
 
     def next_turn():
         nonlocal idx
-        for _ in range(5):
-            c = cycle[idx % 4]
+        for _ in range(len(cycle) + 1):
+            c = cycle[idx % len(cycle)]
             idx += 1
             if c in active:
                 return c
@@ -718,8 +724,8 @@ def _walk(moves, cells, fn, camps, flag_cells, direction):
         if last_mover is not None and mover is not None:
             order = [c for c in cycle]
             i0 = order.index(last_mover)
-            for step in range(1, 4):
-                c = order[(i0 + step) % 4]
+            for step in range(1, len(order)):
+                c = order[(i0 + step) % len(order)]
                 if c == mover:
                     break
                 if c in active:
@@ -756,14 +762,24 @@ def _walk(moves, cells, fn, camps, flag_cells, direction):
             "total": len(moves)}
 
 
-def determine_jqh_end_result(eliminated: dict[str, str]) -> tuple[list[str], str]:
+def determine_jqh_end_result(
+    eliminated: dict[str, str],
+    piece_colors: set[str] | None = None,
+) -> tuple[list[str], str]:
     """终局判定 (分类规则)。
 
-    - 恰有一方联盟两家均出局(被挖旗/认输/判负) 且对方尚有在场 -> 对方联盟胜;
+    - 二人对局(仅两家参与): 两家为对手, 恰一家存活 -> 该方"胜负已分";
+    - 四人对局: 联盟 = 对家 (蓝,红) 上下 vs (绿,黑) 左右; 恰有一方联盟两家
+      均出局(被挖旗/认输/判负) 且对方尚有在场 -> 对方联盟胜;
     - 否则(双方联盟的两家都被挖旗或认输/四家全灭, 或双方均未被消灭
       —— 记录中断、超时、和局) -> ("异常中断或和局")。
-    联盟 = 对家: (蓝,红) 上下 vs (绿,黑) 左右。
     """
+    colors = set(piece_colors) if piece_colors else set(_JQH_TURN_CYCLE)
+    if len(colors) == 2:
+        alive = [c for c in colors if c not in eliminated]
+        if len(alive) == 1:
+            return [alive[0]], "胜负已分"
+        return [], "异常中断或和局"
     alliances = (("蓝", "红"), ("绿", "黑"))
     dead = set(eliminated)
     surv_a = [c for c in alliances[0] if c not in dead]
@@ -812,7 +828,8 @@ def analyze_jqh_game(raw: bytes) -> dict:
     main_color, main_color_name = decode_jqh_main_color(raw)
     moves, transform, _score = parse_jqh_moves(raw, pieces)
     sim = simulate_jqh_game(moves, pieces, "I")
-    winners, desc = determine_jqh_end_result(sim["eliminated"])
+    winners, desc = determine_jqh_end_result(
+        sim["eliminated"], {c for c, _ in pieces.values()})
     return {
         "pieces": pieces,
         "main_color": main_color_name,
