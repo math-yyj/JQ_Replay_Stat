@@ -846,8 +846,7 @@ def analyze_jqh_game(raw: bytes) -> dict:
 # 联众 .JQH 通用引擎: 状态迭代 / 司令军长轨迹 / 空炸筛选
 # ============================================================
 
-# 座位映射: 联众固定视角(蓝上/绿左/红下/黑右) -> QQ 规范色(黄上/紫左/绿下/蓝右)
-JQH_BLOCK_TO_QQ = {"蓝": "黄", "绿": "紫", "红": "绿", "黑": "蓝"}
+# 座位映射: 联众块色 -> 面板座位标签(解码块色的固定家位)
 JQH_BLOCK_SEAT = {"蓝": "上", "绿": "左", "红": "下", "黑": "右"}
 
 # "最大仅吃到连长"允许的击杀棋子(与 QQ 侧一致)
@@ -1024,13 +1023,15 @@ def iter_jqh_states(raw: bytes):
     """按行棋顺序推演全局状态, 依次产出 (步号, 状态dict)。
 
     首个产出为初始布阵(步号0), 之后每步产出一次; 含认输/扛旗/连跳判负清子。
-    状态 dict: {(r,c): (QQ规范色, ItemType)}; 消费方应立即读取, 勿保存引用。
+    状态 dict: {(r,c): (联众色, ItemType)}; 色为解码块色(红/绿/蓝/黑),
+    坐标为"红上/黑左/蓝下/右绿"的联众规范帧(布阵网格旋转180°);
+    消费方应立即读取, 勿保存引用。
     """
     c2i = get_char_to_itemtype()
     for no, board, _ev in _jqh_replay_walk(raw):
         yield no, {
-            pos: (JQH_BLOCK_TO_QQ[col], c2i[ch])
-            for pos, (col, ch) in board.items()
+            (16 - r, 16 - c): (col, c2i[ch])
+            for (r, c), (col, ch) in board.items()
         }
 
 

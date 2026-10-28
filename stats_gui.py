@@ -53,6 +53,50 @@ EMPTY_TEXT = "(无样本)"
 CAMP_POSITIONS = {(1, 1), (1, 3), (2, 2), (3, 1), (3, 3)}
 
 
+class FamilyPalette:
+    """棋子控件/条件棋盘面板的平台配色与方位。
+
+    families: (键, 显示名, 底色, 描边, 深字, 反白字, 座位标签, 合法性键[QQ色])
+    """
+
+    def __init__(self, families, region_fill: dict, canonical_text: str):
+        self.order = [f[0] for f in families]
+        self.display = {f[0]: f[1] for f in families}
+        self.fill = {f[0]: f[2] for f in families}
+        self.line = {f[0]: f[3] for f in families}
+        self.text = {f[0]: f[4] for f in families}
+        self.text_on = {f[0]: f[5] for f in families}
+        self.seat = {f[0]: f[6] for f in families}
+        self.legal_key = {f[0]: f[7] for f in families}
+        self.region_fill = dict(region_fill)
+        self.canonical_text = canonical_text
+
+
+# QQ模式: 上橙红 / 左紫 / 下绿 / 右蓝
+QQ_PALETTE = FamilyPalette(
+    (
+        ("黄", "橙红", "#E2582B", "#A63A18", "#8A3410", "#FFFFFF", "上家", "黄"),
+        ("紫", "紫", "#9C6BC0", "#5E3A82", "#5E3A82", "#FFFFFF", "左家", "紫"),
+        ("绿", "绿", "#5FA85F", "#2F6B2F", "#2F6B2F", "#FFFFFF", "下家", "绿"),
+        ("蓝", "蓝", "#4F86C6", "#2B5585", "#2B5585", "#FFFFFF", "右家", "蓝"),
+    ),
+    {"up": "#FDE8E2", "left": "#F1E6F5", "down": "#E6F4E3", "right": "#E3F0FA"},
+    "旗/雷限初始位；方位：上橙红 / 左紫 / 下绿 / 右蓝；悬停条件格查看格内“或”条件",
+)
+
+# 联众模式: 上红 / 左黑 / 下蓝 / 右绿(数据旋转180°使解码色真实落位)
+LZ_PALETTE = FamilyPalette(
+    (
+        ("红", "红", "#E2582B", "#A63A18", "#8A3410", "#FFFFFF", "上家", "黄"),
+        ("黑", "黑", "#5B5B5B", "#2F2F2F", "#2F2F2F", "#FFFFFF", "左家", "紫"),
+        ("蓝", "蓝", "#4F86C6", "#2B5585", "#2B5585", "#FFFFFF", "下家", "绿"),
+        ("绿", "绿", "#5FA85F", "#2F6B2F", "#2F6B2F", "#FFFFFF", "右家", "蓝"),
+    ),
+    {"up": "#FDE8E2", "left": "#ECECEC", "down": "#E3F0FA", "right": "#E6F4E3"},
+    "旗/雷限初始位；方位：上红 / 左黑 / 下蓝 / 右绿；悬停条件格查看格内“或”条件",
+)
+
+
 class BasePanel(ttk.Frame):
     """面板基类: 提供行营位置常量和公共方法"""
 
@@ -3629,11 +3673,11 @@ class QQBatchPanel(ttk.Frame):
         self._progress_queue: queue.Queue = queue.Queue()
         self._drag = None
         self._piece_buttons: dict[tuple[str, int], tk.Label] = {}
+        self.palette = QQ_PALETTE
         self.first_only_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(
             value="拖拽或点击左侧棋子；可配置全盘，旗/雷限初始位；结果格需左键点亮")
-        self.cond_hover_var = tk.StringVar(
-            value="旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右；悬停条件格查看格内“或”条件")
+        self.cond_hover_var = tk.StringVar(value=self.palette.canonical_text)
         self._build_ui()
 
     @property
@@ -3671,25 +3715,8 @@ class QQBatchPanel(ttk.Frame):
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         left.configure(width=205)
         left.grid_propagate(False)
-        for color in SEAT_COLORS:
-            group = ttk.LabelFrame(left, text=f"{color} · {CANONICAL_SEAT[color]}")
-            group.pack(fill=tk.X, padx=4, pady=(2, 4))
-            for idx, piece in enumerate(PIECE_ORDER):
-                row, col = divmod(idx, 6)
-                piece_code = int(piece)
-                lbl = tk.Label(
-                    group, text=PIECE_SHORT[piece_code], width=2, height=1,
-                    bg=COLOR_FILL[color], fg=COLOR_TEXT_ON[color],
-                    font=("Microsoft YaHei UI", 9, "bold"),
-                    relief=tk.RAISED, bd=1, cursor="hand2")
-                lbl.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
-                lbl.bind("<ButtonPress-1>",
-                         lambda e, c=color, p=piece_code: self._on_piece_press(c, p, e))
-                lbl.bind("<B1-Motion>", self._on_piece_motion)
-                lbl.bind("<ButtonRelease-1>", self._on_piece_release)
-                self._piece_buttons[(color, piece_code)] = lbl
-            for col in range(6):
-                group.columnconfigure(col, weight=1)
+        self._palette_frame = left
+        self._build_palette_groups()
 
         cond_frame = ttk.LabelFrame(
             main, text="条件棋盘（格内或 / 格间且；全盘可选）")
@@ -3704,7 +3731,7 @@ class QQBatchPanel(ttk.Frame):
         self.cond_canvas.bind("<Button-3>", self._on_cond_right_click)
         self.cond_canvas.bind("<Motion>", self._on_cond_motion)
         self.cond_canvas.bind("<Leave>", lambda _e: self.cond_hover_var.set(
-            "旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右；悬停条件格查看格内“或”条件"))
+            self.palette.canonical_text))
 
         result_frame = ttk.LabelFrame(
             main, text=self._result_title())
@@ -3732,6 +3759,34 @@ class QQBatchPanel(ttk.Frame):
         y0 = self.MARGIN + row * self.CELL
         return x0, y0, x0 + self.CELL, y0 + self.CELL
 
+    def _build_palette_groups(self) -> None:
+        """按当前 palette 重建左侧棋子控件组(平台切换时调用)。"""
+        left = self._palette_frame
+        for child in left.winfo_children():
+            child.destroy()
+        self._piece_buttons.clear()
+        pal = self.palette
+        for color in pal.order:
+            group = ttk.LabelFrame(
+                left, text=f"{pal.display[color]} · {pal.seat[color]}")
+            group.pack(fill=tk.X, padx=4, pady=(2, 4))
+            for idx, piece in enumerate(PIECE_ORDER):
+                row, col = divmod(idx, 6)
+                piece_code = int(piece)
+                lbl = tk.Label(
+                    group, text=PIECE_SHORT[piece_code], width=2, height=1,
+                    bg=pal.fill[color], fg=pal.text_on[color],
+                    font=("Microsoft YaHei UI", 9, "bold"),
+                    relief=tk.RAISED, bd=1, cursor="hand2")
+                lbl.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+                lbl.bind("<ButtonPress-1>",
+                         lambda e, c=color, p=piece_code: self._on_piece_press(c, p, e))
+                lbl.bind("<B1-Motion>", self._on_piece_motion)
+                lbl.bind("<ButtonRelease-1>", self._on_piece_release)
+                self._piece_buttons[(color, piece_code)] = lbl
+            for col in range(6):
+                group.columnconfigure(col, weight=1)
+
     def _draw_board_base(self, canvas: tk.Canvas) -> None:
         canvas.delete("all")
         for row in range(17):
@@ -3743,7 +3798,7 @@ class QQBatchPanel(ttk.Frame):
                     canvas.create_rectangle(x0, y0, x1, y1,
                                             fill="#F7F7F7", outline="#F7F7F7")
                     continue
-                fill = REGION_FILL.get(region, "#FAFAFA")
+                fill = self.palette.region_fill.get(region, "#FAFAFA")
                 if kind == "C":
                     fill = "#D5D5D5"
                 elif kind == "R":
@@ -3791,8 +3846,9 @@ class QQBatchPanel(ttk.Frame):
         ghost.overrideredirect(True)
         ghost.attributes("-topmost", True)
         tk.Label(
-            ghost, text=PIECE_SHORT[piece], bg=COLOR_FILL[color],
-            fg=COLOR_TEXT_ON[color], font=("Microsoft YaHei UI", 12, "bold"),
+            ghost, text=PIECE_SHORT[piece], bg=self.palette.fill[color],
+            fg=self.palette.text_on[color],
+            font=("Microsoft YaHei UI", 12, "bold"),
             relief=tk.SOLID, bd=2, padx=4, pady=2,
         ).pack()
         ghost.geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
@@ -3840,10 +3896,11 @@ class QQBatchPanel(ttk.Frame):
         self._piece_buttons[(color, piece)].config(
             relief=tk.SUNKEN, bd=2, highlightthickness=2,
             highlightbackground="#FF6F00")
-        self._legal = legal_cells(color, piece)
+        self._legal = legal_cells(self.palette.legal_key[color], piece)
         self._redraw_condition_board()
         self.status_var.set(
-            f"已选中: {color}-{PIECE_SHORT[piece]}；左键添加/取消，右键清空该格")
+            f"已选中: {self.palette.display[color]}-{PIECE_SHORT[piece]}；"
+            f"左键添加/取消，右键清空该格")
 
     def _cell_from_xy(self, x: float, y: float) -> tuple[int, int] | None:
         col = int((x - self.MARGIN) // self.CELL)
@@ -3888,7 +3945,7 @@ class QQBatchPanel(ttk.Frame):
         self._redraw_condition_board()
         self._redraw_result_board()
         self.status_var.set(
-            f"{action}条件: {color}-{PIECE_SHORT[piece]} @ "
+            f"{action}条件: {self.palette.display[color]}-{PIECE_SHORT[piece]} @ "
             f"{chr(65 + cell[1])}{cell[0] + 1}")
 
     def _add_condition(self, cell: tuple[int, int]) -> None:
@@ -3899,14 +3956,13 @@ class QQBatchPanel(ttk.Frame):
         self._redraw_condition_board()
         self._redraw_result_board()
         self.status_var.set(
-            f"条件: {color}-{PIECE_SHORT[piece]} @ "
+            f"条件: {self.palette.display[color]}-{PIECE_SHORT[piece]} @ "
             f"{chr(65 + cell[1])}{cell[0] + 1}")
 
     def _on_cond_motion(self, event) -> None:
         cell = self._cell_from_xy(event.x, event.y)
         if cell is None:
-            self.cond_hover_var.set(
-                "旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右；悬停条件格查看格内“或”条件")
+            self.cond_hover_var.set(self.palette.canonical_text)
             return
         row, col = cell
         coord = f"{chr(65 + col)}{row + 1}"
@@ -3916,9 +3972,10 @@ class QQBatchPanel(ttk.Frame):
             return
         ordered = sorted(
             alternatives,
-            key=lambda item: (SEAT_COLORS.index(item[0]), item[1]))
+            key=lambda item: (self.palette.order.index(item[0]), item[1]))
         text = "  或  ".join(
-            f"{color}-{PIECE_SHORT[piece]}" for color, piece in ordered)
+            f"{self.palette.display[color]}-{PIECE_SHORT[piece]}"
+            for color, piece in ordered)
         self.cond_hover_var.set(f"{coord}  条件: {text}")
 
     def _redraw_condition_board(self) -> None:
@@ -3945,21 +4002,21 @@ class QQBatchPanel(ttk.Frame):
                 continue
             ordered = sorted(
                 alternatives,
-                key=lambda item: (SEAT_COLORS.index(item[0]), item[1]))
+                key=lambda item: (self.palette.order.index(item[0]), item[1]))
             x0, y0, x1, y1 = self._bbox(row, col)
             canvas.create_rectangle(
                 x0 + 1, y0 + 1, x1 - 1, y1 - 1,
-                outline=COLOR_LINE[ordered[0][0]], width=1, tags="dyn")
+                outline=self.palette.line[ordered[0][0]], width=1, tags="dyn")
             if len(ordered) == 1:
                 color, piece = ordered[0]
                 canvas.create_oval(
                     x0 + 3, y0 + 3, x1 - 3, y1 - 3,
-                    fill=COLOR_FILL[color], outline=COLOR_LINE[color], width=2,
+                    fill=self.palette.fill[color], outline=self.palette.line[color], width=2,
                     tags="dyn")
                 canvas.create_text(
                     (x0 + x1) / 2, (y0 + y1) / 2, text=PIECE_SHORT[piece],
                     font=("Microsoft YaHei UI", 8, "bold"),
-                    fill=COLOR_TEXT_ON[color], tags="dyn")
+                    fill=self.palette.text_on[color], tags="dyn")
                 continue
             if len(ordered) == 2:
                 cy = (y0 + y1) / 2
@@ -3967,12 +4024,12 @@ class QQBatchPanel(ttk.Frame):
                     cx = x0 + 9 if idx == 0 else x1 - 9
                     canvas.create_oval(
                         cx - 7, cy - 7, cx + 7, cy + 7,
-                        fill=COLOR_FILL[color], outline=COLOR_LINE[color],
+                        fill=self.palette.fill[color], outline=self.palette.line[color],
                         width=1, tags="dyn")
                     canvas.create_text(
                         cx, cy, text=PIECE_SHORT[piece],
                         font=("Microsoft YaHei UI", 7, "bold"),
-                        fill=COLOR_TEXT_ON[color], tags="dyn")
+                        fill=self.palette.text_on[color], tags="dyn")
                 continue
             centers = (
                 (x0 + 7, y0 + 7), (x1 - 7, y0 + 7),
@@ -3991,12 +4048,12 @@ class QQBatchPanel(ttk.Frame):
                 color, piece = shown[idx]
                 canvas.create_oval(
                     cx - 5, cy - 5, cx + 5, cy + 5,
-                    fill=COLOR_FILL[color], outline=COLOR_LINE[color],
+                    fill=self.palette.fill[color], outline=self.palette.line[color],
                     width=1, tags="dyn")
                 canvas.create_text(
                     cx, cy, text=PIECE_SHORT[piece],
                     font=("Microsoft YaHei UI", 5, "bold"),
-                    fill=COLOR_TEXT_ON[color], tags="dyn")
+                    fill=self.palette.text_on[color], tags="dyn")
 
     def _redraw_result_board(self) -> None:
         canvas = self.result_canvas
@@ -4042,14 +4099,14 @@ class QQBatchPanel(ttk.Frame):
                 (x0 + x1) / 2, (y0 + y1) / 2 - 2,
                 text=PIECE_SHORT[piece],
                 font=("Microsoft YaHei UI", 10, "bold"),
-                fill=COLOR_TEXT[color], tags="dyn")
+                fill=self.palette.text[color], tags="dyn")
             width = max(2, (self.CELL - 6) * count / cell_total)
             canvas.create_rectangle(
                 x0 + 3, y1 - 6, x1 - 3, y1 - 2,
                 fill="#EEEEEE", outline="", tags="dyn")
             canvas.create_rectangle(
                 x0 + 3, y1 - 6, x0 + 3 + width, y1 - 2,
-                fill=COLOR_FILL[color], outline="", tags="dyn")
+                fill=self.palette.fill[color], outline="", tags="dyn")
 
     def _on_result_click(self, event) -> None:
         cell = self._cell_from_xy(event.x, event.y)
@@ -4095,9 +4152,9 @@ class QQBatchPanel(ttk.Frame):
         for (color, piece), count in top:
             if show_pct:
                 pct = count / cell_total * 100 if cell_total else 0
-                parts.append(f"{color}-{PIECE_SHORT[piece]} {pct:.1f}%")
+                parts.append(f"{self.palette.display[color]}-{PIECE_SHORT[piece]} {pct:.1f}%")
             else:
-                parts.append(f"{color}-{PIECE_SHORT[piece]} {count}")
+                parts.append(f"{self.palette.display[color]}-{PIECE_SHORT[piece]} {count}")
         self.hover_var.set(f"{coord}  " + "   ".join(parts))
 
     def _result_title(self) -> str:
@@ -4299,8 +4356,7 @@ class QQBatchPanel(ttk.Frame):
             lbl.config(relief=tk.RAISED, bd=1, highlightthickness=0)
         self._redraw_condition_board()
         self._redraw_result_board()
-        self.cond_hover_var.set(
-            "旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右；悬停条件格查看格内“或”条件")
+        self.cond_hover_var.set(self.palette.canonical_text)
         self.hover_var.set("悬停已点亮格子查看前 3 名明细")
         self.status_var.set(
             "拖拽或点击左侧棋子；可配置全盘，旗/雷限初始位；结果格需左键点亮")
@@ -4552,17 +4608,26 @@ class GeneralFilterPanel(QQBatchPanel):
     """通用筛选条件统计: 条件棋盘/结果棋盘统计, QQ(.jgs) 与联众(.jqh) 双平台。
     思路参考 QQ复盘批量统计(QQBatchPanel) + 联众复盘解析(lianzhong):
     条件与交互完全复用 QQ 面板, 复盘范围由全局 平台 radio 切换。
-    条件色为 QQ 规范色(黄上/紫左/绿下/蓝右), 联众复盘按同座位映射
-    (蓝上/绿左/红下/黑右) 套用同一条件。
+    平台配色与方位(QQ_PALETTE/LZ_PALETTE)随 平台 radio 切换:
+      QQ:   棋子控件 橙红/紫/绿/蓝, 棋盘 上橙红/左紫/下绿/右蓝;
+      联众: 棋子控件 红/黑/蓝/绿(橙红/灰黑/蓝/绿底色), 棋盘 上红/左黑/下蓝/右绿
+            (lianzhong 状态帧旋转180°, 使解码红方落位于上)。
     """
 
     def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar,
                  display_mode_getter=None):
         super().__init__(parent, folder_var, display_mode_getter)
         self._source_var = source_var
-        self.cond_hover_var.set(
-            "旗/雷限初始位；方位：黄上 / 紫左 / 绿下 / 蓝右"
-            "（联众同座位：蓝上/绿左/红下/黑右）；悬停条件格查看格内“或”条件")
+        self.update_platform()
+
+    def update_platform(self) -> None:
+        """随全局 平台 radio 切换棋子配色/方位与数据帧(条件口径互斥, 一并清空)。"""
+        self.palette = (LZ_PALETTE if self._source_var.get() == "联众"
+                        else QQ_PALETTE)
+        if hasattr(self, "_palette_frame"):
+            self._build_palette_groups()
+        self._clear_all()
+        self.cond_hover_var.set(self.palette.canonical_text)
         self.status_var.set(
             "拖拽或点击左侧棋子；可配置全盘，旗/雷限初始位；结果格需左键点亮")
 
@@ -5199,6 +5264,8 @@ class StatsGUI:
 
         # 清空所有统计结果
         self._clear_all_stats()
+        # 通用条件统计面板随平台切换棋子配色/方位
+        self.general_panel.update_platform()
 
     def _clear_all_stats(self) -> None:
         """清空所有面板的统计结果"""
