@@ -4422,18 +4422,19 @@ class QQQuickFilterPanel(ttk.Frame):
                  "凡被对手炸弹换掉且满足所选条件即命中；“最大仅吃到连长”指"
                  "击杀仅限连长/排长/工兵（含什么都没吃）。复盘范围随全局平台"
                  "选择（QQ .jgs / 联众 .jqh）。双击结果行打开复盘（等同资源"
-                 "管理器双击），右键复制完整地址。",
+                 "管理器双击），右键复制完整地址；同局各行操作均指向该复盘。",
             wraplength=760).pack(fill=tk.X, padx=6, pady=(0, 4))
 
         result = ttk.LabelFrame(
-            self, text="命中结果（每行一局；一局多条事件时格内多行显示）")
+            self, text="命中结果（每行一条空炸事件；一局多条事件占多行，"
+                       "复盘名/地址仅首行显示）")
         result.pack(fill=tk.BOTH, expand=True, padx=2)
 
         cols = ("file", "seat", "player", "piece", "kills", "step", "kind",
                 "path")
         heads = ("文件", "方位", "玩家", "棋子", "击杀记录", "阵亡步",
                  "空炸类型", "详细地址")
-        widths = (170, 42, 150, 46, 118, 60, 130, 240)
+        widths = (165, 42, 255, 46, 105, 58, 125, 235)
         style = ttk.Style(self)
         style.configure("Quick.Treeview", font=("Microsoft YaHei UI", 8),
                         rowheight=22)
@@ -4532,43 +4533,28 @@ class QQQuickFilterPanel(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         self._row_paths.clear()
         grouped: dict[str, list] = {}
-        order: list[str] = []
         for full_path, rec in rows:
-            if full_path not in grouped:
-                grouped[full_path] = []
-                order.append(full_path)
-            grouped[full_path].append(rec)
+            grouped.setdefault(full_path, []).append(rec)
 
-        def event_blocks(values) -> str:
-            """每事件占两行(第二行空), 与玩家列的炸方/被炸方逐行对齐。"""
-            out = []
-            for v in values:
-                out.append(v)
-                out.append("")
-            return "\n".join(out)
-
-        max_lines = 1
-        for full_path in order:
-            recs = grouped[full_path]
-            max_lines = max(max_lines, len(recs) * 2)
-            player_lines = []
-            for r in recs:
-                player_lines.append(f"炸方：{r.get('killer_player') or '?'}")
-                player_lines.append(f"被炸方：{r['player']}")
-            iid = self.tree.insert("", tk.END, values=(
-                os.path.basename(full_path),
-                event_blocks(r["seat"] for r in recs),
-                "\n".join(player_lines),
-                event_blocks(r["piece"] for r in recs),
-                event_blocks("、".join(r["kills"]) if r["kills"] else "（无）"
-                             for r in recs),
-                event_blocks(str(r["death_step"]) for r in recs),
-                event_blocks(r.get("kind") or "—" for r in recs),
-                full_path))
-            self._row_paths[iid] = full_path
-        # 行高随本批最大事件数适配(每行内容纵向居中, 各列逐行对齐)
-        ttk.Style(self).configure(
-            "Quick.Treeview", rowheight=max(22, max_lines * 17 + 6))
+        hit_files = set()
+        n_empty = 0
+        for full_path, recs in grouped.items():
+            hit_files.add(os.path.basename(full_path))
+            for k, r in enumerate(recs):
+                if r["empty"]:
+                    n_empty += 1
+                iid = self.tree.insert("", tk.END, values=(
+                    os.path.basename(full_path) if k == 0 else "",
+                    r["seat"],
+                    f"炸方：{r.get('killer_player') or '?'} / 被炸方：{r['player']}",
+                    r["piece"],
+                    "、".join(r["kills"]) if r["kills"] else "（无）",
+                    r["death_step"],
+                    r.get("kind") or "—",
+                    full_path if k == 0 else "",
+                ))
+                self._row_paths[iid] = full_path
+        ttk.Style(self).configure("Quick.Treeview", rowheight=22)
         hit_files = {os.path.basename(p) for p in grouped}
         n_empty = sum(1 for recs in grouped.values() for r in recs if r["empty"])
 
