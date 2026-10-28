@@ -1233,6 +1233,177 @@ def find_empty_bomb_victims(replay: QQReplay, mode: str = "none") -> list[dict]:
     return out
 
 
+# ============================================================
+# 装令复盘筛选: 关键子(旅/师/军/司)追踪与"装令战术"匹配
+# ============================================================
+
+KEY_RANKS = ("旅", "师", "军", "司")
+
+# 装大触发: A -> 可歼灭的对手子(单字)
+FAKE_TRIGGER_VICTIMS = {"旅": ("团",), "师": ("旅", "团"), "军": ("师", "旅")}
+
+
+def trace_key_pieces(replay: QQReplay) -> list[dict]:
+    """追踪四家 旅/师/军/司(单字名), 记录击杀(步, 敌子, 敌色)与阵亡方式。
+
+    与 trace_heroes 同一全局战况推演(认输/扛旗/连跳判负清子);
+    击杀含主动吃子与被撞反吃; death_by_bomb = 与敌炸弹同尽。
+    """
+    board = dict(replay.board)
+    traces: list[dict] = []
+    at: dict[tuple[int, int], dict] = {}
+    for pos, p in board.items():
+        rank = PIECE_SHORT.get(p.piece, "")
+        if rank in KEY_RANKS:
+            rec = {"color": p.color, "rank": rank, "pos": pos, "kills": [],
+                   "death_step": None, "death_kind": "在场",
+                   "death_by_bomb": False, "killer_color": ""}
+            traces.append(rec)
+            at[pos] = rec
+
+    alive = {color: True for color in COLOR_ORDER}
+    defeated_at: dict[str, int] = {}
+    skip_count = {color: 0 for color in COLOR_ORDER}
+    turn_idx = len(replay.turn_order) - 1
+
+    def rank_at(pos):
+        rec = at.get(pos)
+        return rec if rec is not None and rec["death_kind"] == "在场" else None
+
+    def sync() -> None:
+        for rec in traces:
+            if rec["death_kind"] != "在场" or rec["pos"] is None:
+                continue
+            p = board.get(rec["pos"])
+            if (p is None or p.color != rec["color"]
+                    or PIECE_SHORT.get(p.piece, "") != rec["rank"]):
+                rec["death_kind"] = "清子"
+
+    def die(rec, step, kind, by_bomb, killer=""):
+        if rec["death_kind"] != "在场":
+            return
+        rec["death_step"] = step
+        rec["death_kind"] = kind
+        rec["death_by_bomb"] = by_bomb
+        rec["killer_color"] = killer
+
+    sync()
+    for kind, item in replay.seq:
+        if kind == "event":
+            event = item
+            color = event.color
+            is_timeout = event.code == 2
+            is_defeat = (event.code == 2 and event.b >= 5) or event.code in (3, 4)
+            if is_defeat and color and alive.get(color):
+                alive[color] = False
+                defeated_at[color] = event.no
+                _remove_all(board, color)
+            if is_timeout and color in replay.turn_order:
+                turn_idx = replay.turn_order.index(color)
+                skip_count[color] = 0
+            sync()
+            continue
+
+        move = item
+        if alive.get(move.color):
+            _check_defeat_before_move(board, move.color, alive, defeated_at, move.no)
+        turn_idx = _track_turn_skip(
+            move, move.no, replay.turn_order, alive, defeated_at,
+            skip_count, turn_idx, board)
+        sync()
+
+        atk = rank_at(move.start)
+        dfn = rank_at(move.end)
+        resolved = resolve_move(move, board)
+        rt = resolved.type
+        a_rank = (PIECE_SHORT.get(resolved.from_piece, "")
+                  if resolved.from_piece is not None else "")
+        d_rank = (PIECE_SHORT.get(resolved.def_piece, "")
+                  if resolved.def_piece is not None else "")
+
+        if rt == "eat":
+            if atk:
+                atk["kills"].append((move.no, d_rank, resolved.defender or ""))
+                atk["pos"] = move.end
+            if dfn:
+                die(dfn, move.no, "被吃", False, move.color)
+        elif rt == "killed":
+            if atk:
+                die(atk, move.no, "被吃", False, resolved.defender or "")
+            if dfn:
+                dfn["kills"].append((move.no, a_rank, move.color))
+        elif rt == "both":
+            if atk:
+                die(atk, move.no, "被炸弹炸死" if d_rank == "弹" else "同尽",
+                    d_rank == "弹", resolved.defender or "")
+            if dfn:
+                die(dfn, move.no, "被炸弹炸死" if a_rank == "弹" else "同尽",
+                    a_rank == "弹", move.color)
+        elif rt == "mine":
+            if atk:
+                die(atk, move.no, "触雷", False, resolved.defender or "")
+        elif rt in ("move", "dig", "flag"):
+            if atk:
+                atk["pos"] = move.end
+        sync()
+    return traces
+
+
+def match_fake_general(traces: list[dict]) -> list[dict]:
+    """装令战术匹配: 先装大, 后在存活期内赚棋或骗炸。
+
+    返回事件 dict: kind(赚棋/骗炸)/color/a(旅|师|军)/x(装大步)/b(司|军)|None/y(结果步)。
+    规则: A装大歼灭对手 团(旅)/旅团(师)/师旅(军); 其后该子存活期内
+      赚棋: 对手在己方司令上折损师/军(B=司), 或在己方军长上折损师(B=军);
+      骗炸: A 在己方司令未阵亡时被对手炸弹换掉。
+    A、B 不同子(B=军 且 A=军 时排除)。
+    """
+    events: list[dict] = []
+    by_color: dict[str, list[dict]] = {}
+    for t in traces:
+        by_color.setdefault(t["color"], []).append(t)
+    for a in traces:
+        victims = FAKE_TRIGGER_VICTIMS.get(a["rank"])
+        if not victims:
+            continue
+        trig = next(((s, v, c) for (s, v, c) in a["kills"]
+                     if c != a["color"] and v in victims), None)
+        if trig is None:
+            continue
+        x = trig[0]
+        death = a["death_step"]
+
+        def in_life(y):
+            return y > x and (death is None or y <= death)
+
+        for b in by_color.get(a["color"], []):
+            if b is a:
+                continue
+            if b["rank"] == "司":
+                for (y, v, c) in b["kills"]:
+                    if c != a["color"] and v in ("师", "军") and in_life(y):
+                        events.append({"kind": "赚棋", "color": a["color"],
+                                       "a": a["rank"], "x": x, "b": "司", "y": y})
+            elif b["rank"] == "军" and a["rank"] != "军":
+                for (y, v, c) in b["kills"]:
+                    if c != a["color"] and v == "师" and in_life(y):
+                        events.append({"kind": "赚棋", "color": a["color"],
+                                       "a": a["rank"], "x": x, "b": "军", "y": y})
+        if a["death_by_bomb"] and death is not None:
+            cmd = next((t for t in by_color.get(a["color"], [])
+                        if t["rank"] == "司"), None)
+            if cmd is not None and (cmd["death_step"] is None
+                                    or cmd["death_step"] > death):
+                events.append({"kind": "骗炸", "color": a["color"],
+                               "a": a["rank"], "x": x, "b": None, "y": death})
+    return events
+
+
+def find_fake_general_events(replay: QQReplay) -> list[dict]:
+    """装令复盘筛选(QQ): 返回装令事件列表(字段见 match_fake_general)。"""
+    return match_fake_general(trace_key_pieces(replay))
+
+
 def _to_text(replay: QQReplay, analysis: ReplayAnalysis) -> str:
     lines = [
         "QQ四国军棋复盘 v2.0",

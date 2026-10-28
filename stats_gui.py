@@ -4369,6 +4369,21 @@ class QQBatchPanel(ttk.Frame):
             self._redraw_result_board()
 
 
+HINT_EMPTY_BOMB = (
+    "空炸司令/军长：追踪四家司令/军长的全局吃子记录（含反吃），"
+    "凡被对手炸弹换掉且满足所选条件即命中；“最大仅吃到连长”指"
+    "击杀仅限连长/排长/工兵（含什么都没吃）。复盘范围随全局平台"
+    "选择（QQ .jgs / 联众 .jqh）。双击结果行打开复盘（等同资源"
+    "管理器双击），右键复制完整地址；同局各行操作均指向该复盘。")
+HINT_FAKE_GENERAL = (
+    "装令复盘筛选：先以旅/师/军歼灭对手 团(旅)/旅团(师)/师旅(军) 装大，"
+    "其后该子存活期内赚棋（对手在己方司令上折损师/军，或在己方军长上"
+    "折损师；B=军时 A 不可为军）或骗炸（该子在己方司令未阵亡时被对手"
+    "炸弹换掉），任一即命中。复盘范围随全局平台选择（QQ .jgs / 联众 "
+    ".jqh）。双击结果行打开复盘，右键复制完整地址；同局各行操作均指向"
+    "该复盘。")
+
+
 class QQQuickFilterPanel(ttk.Frame):
     """常用模式一键筛选: 筛选模式 N 选 1(当前仅 空炸司令/军长), 双平台。"""
 
@@ -4398,35 +4413,38 @@ class QQQuickFilterPanel(ttk.Frame):
         ttk.Label(row0, text="筛选模式:").pack(side=tk.LEFT)
         ttk.Radiobutton(
             row0, text="空炸司令/军长", value="empty_bomb",
-            variable=self.filter_var).pack(side=tk.LEFT, padx=(4, 0))
-        # 新增筛选模式时在此追加 radio 项(值写入 filter_var)并配对应参数区
-
-        row = ttk.Frame(top)
-        row.pack(fill=tk.X, padx=6, pady=(2, 2))
-        ttk.Label(row, text="命中条件:").pack(side=tk.LEFT)
+            variable=self.filter_var,
+            command=self._on_filter_change).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Radiobutton(
-            row, text="什么都没吃", value="none",
+            row0, text="装令复盘筛选", value="fake_general",
+            variable=self.filter_var,
+            command=self._on_filter_change).pack(side=tk.LEFT, padx=(12, 0))
+        # 新增筛选模式时在此追加 radio 项(值写入 filter_var)并配对应参数区/结果列
+
+        self.mode_row = ttk.Frame(top)
+        self.mode_row.pack(fill=tk.X, padx=6, pady=(2, 2))
+        ttk.Label(self.mode_row, text="命中条件:").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            self.mode_row, text="什么都没吃", value="none",
             variable=self.mode_var).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Radiobutton(
-            row, text="最大仅吃到连长", value="max_lian",
+            self.mode_row, text="最大仅吃到连长", value="max_lian",
             variable=self.mode_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        self.btn_row = ttk.Frame(top)
+        self.btn_row.pack(fill=tk.X, padx=6, pady=(2, 2))
         self.scan_btn = ttk.Button(
-            row, text="开始筛选", command=self._start_scan)
-        self.scan_btn.pack(side=tk.LEFT, padx=(18, 0))
-        ttk.Button(row, text="清空结果", command=self.clear_stats).pack(
+            self.btn_row, text="开始筛选", command=self._start_scan)
+        self.scan_btn.pack(side=tk.LEFT)
+        ttk.Button(self.btn_row, text="清空结果", command=self.clear_stats).pack(
             side=tk.LEFT, padx=(6, 0))
 
-        ttk.Label(
-            top,
-            text="空炸司令/军长：追踪四家司令/军长的全局吃子记录（含反吃），"
-                 "凡被对手炸弹换掉且满足所选条件即命中；“最大仅吃到连长”指"
-                 "击杀仅限连长/排长/工兵（含什么都没吃）。复盘范围随全局平台"
-                 "选择（QQ .jgs / 联众 .jqh）。双击结果行打开复盘（等同资源"
-                 "管理器双击），右键复制完整地址；同局各行操作均指向该复盘。",
-            wraplength=760).pack(fill=tk.X, padx=6, pady=(0, 4))
+        self.hint_label = ttk.Label(
+            top, text=HINT_EMPTY_BOMB, wraplength=760)
+        self.hint_label.pack(fill=tk.X, padx=6, pady=(0, 4))
 
         result = ttk.LabelFrame(
-            self, text="命中结果（每行一条空炸事件；一局多条事件占多行，"
+            self, text="命中结果（每行一条事件；一局多条事件占多行，"
                        "复盘名/地址仅首行显示）")
         result.pack(fill=tk.BOTH, expand=True, padx=2)
 
@@ -4457,6 +4475,17 @@ class QQQuickFilterPanel(ttk.Frame):
         ttk.Label(self, textvariable=self.status_var).pack(
             fill=tk.X, pady=(2, 0))
 
+    def _on_filter_change(self) -> None:
+        """切换筛选模式: 参数区显隐与说明随模式更新(口径互斥, 清空结果)。"""
+        if self.filter_var.get() == "fake_general":
+            self.mode_row.pack_forget()
+            self.hint_label.config(text=HINT_FAKE_GENERAL)
+        else:
+            self.mode_row.pack(fill=tk.X, padx=6, pady=(2, 2),
+                               before=self.btn_row)
+            self.hint_label.config(text=HINT_EMPTY_BOMB)
+        self.clear_stats()
+
     def _start_scan(self) -> None:
         folder = self._folder_var.get().strip()
         if not folder or not Path(folder).is_dir():
@@ -4465,6 +4494,7 @@ class QQQuickFilterPanel(ttk.Frame):
         self.scan_btn.config(state=tk.DISABLED)
         self.status_var.set("统计中……")
         mode = self.mode_var.get()
+        filter_key = self.filter_var.get()
         is_lianzhong = self._source_var.get() == "联众"
         progress = [0]
         total_ref = [0]
@@ -4473,7 +4503,34 @@ class QQQuickFilterPanel(ttk.Frame):
             try:
                 rows = []
                 failed = 0
-                if is_lianzhong:
+                if filter_key == "fake_general":
+                    if is_lianzhong:
+                        from src.lianzhong import find_jqh_fake_general_events
+                        files = sorted(glob.glob(
+                            os.path.join(folder, "**", "*.jqh"), recursive=True))
+                        total_ref[0] = len(files)
+                        for jqh_file in files:
+                            try:
+                                raw = open(jqh_file, "rb").read()
+                                for ev in find_jqh_fake_general_events(raw):
+                                    rows.append((jqh_file, ev))
+                            except Exception:
+                                failed += 1
+                            progress[0] += 1
+                    else:
+                        from src.layout_stats import find_jgs_files
+                        from src.qq_replay import find_fake_general_events
+                        files = find_jgs_files(folder)
+                        total_ref[0] = len(files)
+                        for jgs_file in files:
+                            try:
+                                rep = parse_jgs(jgs_file)
+                                for ev in find_fake_general_events(rep):
+                                    rows.append((jgs_file, ev))
+                            except Exception:
+                                failed += 1
+                            progress[0] += 1
+                elif is_lianzhong:
                     from src.lianzhong import find_jqh_empty_bomb_victims
                     files = sorted(glob.glob(
                         os.path.join(folder, "**", "*.jqh"), recursive=True))
@@ -4499,9 +4556,10 @@ class QQQuickFilterPanel(ttk.Frame):
                         except Exception:
                             failed += 1
                         progress[0] += 1
-                self._scan_result = (rows, total_ref[0], failed, mode, None)
+                self._scan_result = (rows, total_ref[0], failed, mode,
+                                     filter_key, None)
             except Exception as e:
-                self._scan_result = ([], 0, 0, mode, str(e))
+                self._scan_result = ([], 0, 0, mode, filter_key, str(e))
 
         self._worker = threading.Thread(target=worker, daemon=True)
         self._worker.start()
@@ -4524,11 +4582,30 @@ class QQQuickFilterPanel(ttk.Frame):
         self.scan_btn.config(state=tk.NORMAL)
         if self._scan_result is None:
             return
-        rows, total, failed, mode, err = self._scan_result
+        rows, total, failed, mode, filter_key, err = self._scan_result
         if err:
             self.status_var.set(f"统计失败: {err}")
             messagebox.showerror("错误", err, parent=self._top)
             return
+
+        platform_text = "联众" if self._source_var.get() == "联众" else "QQ"
+        pal = LZ_PALETTE if platform_text == "联众" else QQ_PALETTE
+
+        if filter_key == "fake_general":
+            cols = ("file", "event", "path")
+            heads = ("文件", "事件描述", "详细地址")
+            widths = (165, 640, 235)
+        else:
+            cols = ("file", "seat", "player", "piece", "kills", "step",
+                    "kind", "path")
+            heads = ("文件", "方位", "玩家", "棋子", "击杀记录", "阵亡步",
+                     "空炸类型", "详细地址")
+            widths = (165, 42, 255, 46, 105, 58, 125, 235)
+        self.tree["columns"] = cols
+        for col, head, width in zip(cols, heads, widths):
+            self.tree.heading(col, text=head)
+            self.tree.column(col, width=width, anchor="w",
+                             stretch=(col in ("path", "event")))
 
         self.tree.delete(*self.tree.get_children())
         self._row_paths.clear()
@@ -4536,35 +4613,53 @@ class QQQuickFilterPanel(ttk.Frame):
         for full_path, rec in rows:
             grouped.setdefault(full_path, []).append(rec)
 
+        def fake_desc(ev) -> str:
+            side = pal.display.get(ev["color"], ev["color"])
+            if ev["kind"] == "赚棋":
+                return (f"{side}方，{ev['a']}装大（{ev['x']}步），"
+                        f"{ev['b']}赚棋（{ev['y']}步）")
+            return f"{side}方，{ev['a']}骗炸（{ev['y']}步）"
+
         hit_files = set()
-        n_empty = 0
+        n_empty = n_zhuang = n_pian = 0
         for full_path, recs in grouped.items():
             hit_files.add(os.path.basename(full_path))
             for k, r in enumerate(recs):
-                if r["empty"]:
-                    n_empty += 1
-                iid = self.tree.insert("", tk.END, values=(
-                    os.path.basename(full_path) if k == 0 else "",
-                    r["seat"],
-                    f"炸方：{r.get('killer_player') or '?'} / 被炸方：{r['player']}",
-                    r["piece"],
-                    "、".join(r["kills"]) if r["kills"] else "（无）",
-                    r["death_step"],
-                    r.get("kind") or "—",
-                    full_path if k == 0 else "",
-                ))
+                if filter_key == "fake_general":
+                    if r["kind"] == "赚棋":
+                        n_zhuang += 1
+                    else:
+                        n_pian += 1
+                    values = (os.path.basename(full_path) if k == 0 else "",
+                              fake_desc(r), full_path if k == 0 else "")
+                else:
+                    if r["empty"]:
+                        n_empty += 1
+                    values = (
+                        os.path.basename(full_path) if k == 0 else "",
+                        r["seat"],
+                        f"炸方：{r.get('killer_player') or '?'} / 被炸方：{r['player']}",
+                        r["piece"],
+                        "、".join(r["kills"]) if r["kills"] else "（无）",
+                        r["death_step"],
+                        r.get("kind") or "—",
+                        full_path if k == 0 else "",
+                    )
+                iid = self.tree.insert("", tk.END, values=values)
                 self._row_paths[iid] = full_path
         ttk.Style(self).configure("Quick.Treeview", rowheight=22)
-        hit_files = {os.path.basename(p) for p in grouped}
-        n_empty = sum(1 for recs in grouped.values() for r in recs if r["empty"])
 
-        mode_text = "什么都没吃" if mode == "none" else "最大仅吃到连长"
-        platform_text = "联众" if self._source_var.get() == "联众" else "QQ"
-        status = (f"范围[{platform_text}] 筛选[空炸司令/军长] "
-                  f"条件[{mode_text}] 扫描 {total} 局，"
-                  f"命中 {len(hit_files)} 局"
-                  f" / {len(rows)} 条记录（什么都没吃 {n_empty} 条 ·"
-                  f"最大仅吃到连长 {len(rows) - n_empty} 条）")
+        if filter_key == "fake_general":
+            status = (f"范围[{platform_text}] 筛选[装令复盘] 扫描 {total} 局，"
+                      f"命中 {len(hit_files)} 局 / {len(rows)} 条事件"
+                      f"（赚棋 {n_zhuang} 条 · 骗炸 {n_pian} 条）")
+        else:
+            mode_text = "什么都没吃" if mode == "none" else "最大仅吃到连长"
+            status = (f"范围[{platform_text}] 筛选[空炸司令/军长] "
+                      f"条件[{mode_text}] 扫描 {total} 局，"
+                      f"命中 {len(hit_files)} 局"
+                      f" / {len(rows)} 条记录（什么都没吃 {n_empty} 条 ·"
+                      f"最大仅吃到连长 {len(rows) - n_empty} 条）")
         if failed:
             status += f"；解析失败 {failed} 个"
         self.status_var.set(status)

@@ -1163,6 +1163,91 @@ def find_jqh_empty_bomb_victims(raw: bytes, mode: str = "none") -> list[dict]:
     return out
 
 
+def trace_jqh_key_pieces(raw: bytes) -> list[dict]:
+    """追踪四家 旅/师/军/司(联众单字), 记录击杀(步, 敌子, 敌块色)与阵亡方式。
+
+    与 trace_jqh_heroes 同一全局战况推演(_jqh_replay_walk);
+    击杀含主动吃子与被撞反吃; death_by_bomb = 与敌炸弹同尽。
+    """
+    records: list[dict] = []
+    at: dict[tuple[int, int], dict] = {}
+
+    def rank_at(pos):
+        rec = at.get(pos)
+        return rec if rec is not None and rec["death_kind"] == "在场" else None
+
+    def die(rec, step, kind, by_bomb, killer=""):
+        if rec["death_kind"] != "在场":
+            return
+        rec["death_step"] = step
+        rec["death_kind"] = kind
+        rec["death_by_bomb"] = by_bomb
+        rec["killer_color"] = killer
+
+    for no, board, ev in _jqh_replay_walk(raw):
+        if no == 0:
+            for pos, (col, ch) in board.items():
+                if ch in ("旅", "师", "军", "司"):
+                    rec = {"color": col, "rank": ch, "pos": pos, "kills": [],
+                           "death_step": None, "death_kind": "在场",
+                           "death_by_bomb": False, "killer_color": ""}
+                    records.append(rec)
+                    at[pos] = rec
+            continue
+        for color, _cause in ev.get("cleared", ()):
+            for rec in records:
+                if rec["color"] == color and rec["death_kind"] == "在场":
+                    rec["death_kind"] = "清子"
+        if ev["kind"] != "move":
+            continue
+        atk = rank_at(ev["start"])
+        dfn = rank_at(ev["end"])
+        res = ev["result"]
+        a_rank = ev["attacker"][1] if ev["attacker"] else ""
+        d_rank = ev["target"][1] if ev["target"] else ""
+        a_color = ev["attacker"][0] if ev["attacker"] else ""
+        d_color = ev["target"][0] if ev["target"] else ""
+        if res == "move":
+            if atk:
+                at.pop(ev["start"], None)
+                atk["pos"] = ev["end"]
+                at[ev["end"]] = atk
+        elif res == "attacker_wins":
+            if atk:
+                atk["kills"].append((no, d_rank, d_color))
+                at.pop(ev["start"], None)
+                atk["pos"] = ev["end"]
+                at[ev["end"]] = atk
+            if dfn:
+                die(dfn, no, "被吃", False, a_color)
+        elif res == "defender_wins":
+            if atk:
+                die(atk, no, "触雷" if d_rank == "雷" else "被吃", False, d_color)
+                at.pop(ev["start"], None)
+            if dfn:
+                dfn["kills"].append((no, a_rank, a_color))
+        elif res == "both_die":
+            if atk:
+                die(atk, no, "被炸弹炸死" if d_rank == "弹" else "同尽",
+                    d_rank == "弹", d_color)
+                at.pop(ev["start"], None)
+            if dfn:
+                die(dfn, no, "被炸弹炸死" if a_rank == "弹" else "同尽",
+                    a_rank == "弹", a_color)
+        elif res == "flag_captured":
+            if atk:
+                at.pop(ev["start"], None)
+                atk["pos"] = ev["end"]
+                at[ev["end"]] = atk
+    return records
+
+
+def find_jqh_fake_general_events(raw: bytes) -> list[dict]:
+    """装令复盘筛选(联众 .jqh): 返回装令事件列表(字段见 qq_replay.match_fake_general)。"""
+    from .qq_replay import match_fake_general
+    return match_fake_general(trace_jqh_key_pieces(raw))
+
+
 class LianzhongReplay:
     """联众四国军棋复盘解析（布阵读取初版）。"""
 
