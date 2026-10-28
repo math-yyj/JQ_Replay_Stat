@@ -4359,7 +4359,8 @@ class QQQuickFilterPanel(ttk.Frame):
                  "双击结果行打开复盘（等同资源管理器双击），右键复制完整地址。",
             wraplength=760).pack(fill=tk.X, padx=6, pady=(0, 4))
 
-        result = ttk.LabelFrame(self, text="命中结果（每行一条：某家司令/军长）")
+        result = ttk.LabelFrame(
+            self, text="命中结果（每行一局；一局多条事件时格内多行显示）")
         result.pack(fill=tk.BOTH, expand=True, padx=2)
 
         cols = ("file", "seat", "player", "piece", "kills", "step", "kind",
@@ -4464,20 +4465,39 @@ class QQQuickFilterPanel(ttk.Frame):
 
         self.tree.delete(*self.tree.get_children())
         self._row_paths.clear()
-        hit_files = set()
-        n_empty = 0
+        grouped: dict[str, list] = {}
+        order: list[str] = []
         for full_path, rec in rows:
-            hit_files.add(os.path.basename(full_path))
-            if rec["empty"]:
-                n_empty += 1
-            kills = "、".join(rec["kills"]) if rec["kills"] else "（无）"
-            verdict = ("空炸司令/军长（什么都没吃）" if rec["empty"]
-                       else "空炸司令/军长（最大仅吃到连长）")
+            if full_path not in grouped:
+                grouped[full_path] = []
+                order.append(full_path)
+            grouped[full_path].append(rec)
+        max_lines = 1
+        for full_path in order:
+            recs = grouped[full_path]
+            max_lines = max(max_lines, len(recs))
+            kills_lines = "\n".join(
+                "、".join(r["kills"]) if r["kills"] else "（无）" for r in recs)
+            kind_lines = "\n".join(r.get("kind") or "—" for r in recs)
+            verdict_lines = "\n".join(
+                ("空炸司令/军长（什么都没吃）" if r["empty"]
+                 else "空炸司令/军长（最大仅吃到连长）") for r in recs)
             iid = self.tree.insert("", tk.END, values=(
-                os.path.basename(full_path), rec["seat"], rec["player"],
-                rec["piece"], kills, rec["death_step"],
-                rec.get("kind") or "—", verdict, full_path))
+                os.path.basename(full_path),
+                "\n".join(r["seat"] for r in recs),
+                "\n".join(r["player"] for r in recs),
+                "\n".join(r["piece"] for r in recs),
+                kills_lines,
+                "\n".join(str(r["death_step"]) for r in recs),
+                kind_lines,
+                verdict_lines,
+                full_path))
             self._row_paths[iid] = full_path
+        # 行高随本批最大事件数适配(每行内容纵向居中, 各列逐行对齐)
+        ttk.Style(self).configure(
+            "Quick.Treeview", rowheight=max(22, max_lines * 17 + 6))
+        hit_files = {os.path.basename(p) for p in grouped}
+        n_empty = sum(1 for recs in grouped.values() for r in recs if r["empty"])
 
         mode_text = "什么都没吃" if mode == "none" else "最大仅吃到连长"
         platform_text = "联众" if self._source_var.get() == "联众" else "QQ"
