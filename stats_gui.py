@@ -4370,7 +4370,7 @@ class QQBatchPanel(ttk.Frame):
 
 
 class QQQuickFilterPanel(ttk.Frame):
-    """QQ 复盘常用模式一键筛选（当前第一套：司令/军长被空炸复盘筛选）"""
+    """常用模式一键筛选: 筛选模式 N 选 1(当前仅 空炸司令/军长), 双平台。"""
 
     def __init__(self, parent, folder_var: tk.StringVar, source_var: tk.StringVar):
         super().__init__(parent, padding=2)
@@ -4379,6 +4379,7 @@ class QQQuickFilterPanel(ttk.Frame):
         self._worker = None
         self._scan_result = None
         self._row_paths: dict[str, str] = {}
+        self.filter_var = tk.StringVar(value="empty_bomb")
         self.mode_var = tk.StringVar(value="none")
         self.status_var = tk.StringVar(
             value="选择文件夹后点击筛选按钮；四家中任一家命中即计入该局")
@@ -4389,11 +4390,19 @@ class QQQuickFilterPanel(ttk.Frame):
         return self.winfo_toplevel()
 
     def _build_ui(self) -> None:
-        top = ttk.LabelFrame(self, text="第一套 · 司令/军长被空炸复盘筛选")
+        top = ttk.LabelFrame(self, text="常用模式一键筛选（N 选 1）")
         top.pack(fill=tk.X, padx=2, pady=(0, 4))
 
+        row0 = ttk.Frame(top)
+        row0.pack(fill=tk.X, padx=6, pady=(4, 2))
+        ttk.Label(row0, text="筛选模式:").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            row0, text="空炸司令/军长", value="empty_bomb",
+            variable=self.filter_var).pack(side=tk.LEFT, padx=(4, 0))
+        # 新增筛选模式时在此追加 radio 项(值写入 filter_var)并配对应参数区
+
         row = ttk.Frame(top)
-        row.pack(fill=tk.X, padx=6, pady=(4, 2))
+        row.pack(fill=tk.X, padx=6, pady=(2, 2))
         ttk.Label(row, text="命中条件:").pack(side=tk.LEFT)
         ttk.Radiobutton(
             row, text="什么都没吃", value="none",
@@ -4402,17 +4411,18 @@ class QQQuickFilterPanel(ttk.Frame):
             row, text="最大仅吃到连长", value="max_lian",
             variable=self.mode_var).pack(side=tk.LEFT, padx=(12, 0))
         self.scan_btn = ttk.Button(
-            row, text="司令/军长被空炸复盘筛选", command=self._start_scan)
+            row, text="开始筛选", command=self._start_scan)
         self.scan_btn.pack(side=tk.LEFT, padx=(18, 0))
         ttk.Button(row, text="清空结果", command=self.clear_stats).pack(
             side=tk.LEFT, padx=(6, 0))
 
         ttk.Label(
             top,
-            text="追踪四家司令/军长的全局吃子记录（含反吃），凡被对手炸弹换掉"
-                 "且满足所选条件即命中；“最大仅吃到连长”指击杀仅限连长/排长/工兵"
-                 "（含什么都没吃）。复盘范围随全局平台选择（QQ .jgs / 联众 .jqh）。"
-                 "双击结果行打开复盘（等同资源管理器双击），右键复制完整地址。",
+            text="空炸司令/军长：追踪四家司令/军长的全局吃子记录（含反吃），"
+                 "凡被对手炸弹换掉且满足所选条件即命中；“最大仅吃到连长”指"
+                 "击杀仅限连长/排长/工兵（含什么都没吃）。复盘范围随全局平台"
+                 "选择（QQ .jgs / 联众 .jqh）。双击结果行打开复盘（等同资源"
+                 "管理器双击），右键复制完整地址。",
             wraplength=760).pack(fill=tk.X, padx=6, pady=(0, 4))
 
         result = ttk.LabelFrame(
@@ -4420,10 +4430,10 @@ class QQQuickFilterPanel(ttk.Frame):
         result.pack(fill=tk.BOTH, expand=True, padx=2)
 
         cols = ("file", "seat", "player", "piece", "kills", "step", "kind",
-                "verdict", "path")
+                "path")
         heads = ("文件", "方位", "玩家", "棋子", "击杀记录", "阵亡步",
-                 "空炸类型", "判定", "详细地址")
-        widths = (170, 42, 112, 46, 118, 60, 130, 190, 240)
+                 "空炸类型", "详细地址")
+        widths = (170, 42, 150, 46, 118, 60, 130, 240)
         style = ttk.Style(self)
         style.configure("Quick.Treeview", font=("Microsoft YaHei UI", 8),
                         rowheight=22)
@@ -4528,25 +4538,32 @@ class QQQuickFilterPanel(ttk.Frame):
                 grouped[full_path] = []
                 order.append(full_path)
             grouped[full_path].append(rec)
+
+        def event_blocks(values) -> str:
+            """每事件占两行(第二行空), 与玩家列的炸方/被炸方逐行对齐。"""
+            out = []
+            for v in values:
+                out.append(v)
+                out.append("")
+            return "\n".join(out)
+
         max_lines = 1
         for full_path in order:
             recs = grouped[full_path]
-            max_lines = max(max_lines, len(recs))
-            kills_lines = "\n".join(
-                "、".join(r["kills"]) if r["kills"] else "（无）" for r in recs)
-            kind_lines = "\n".join(r.get("kind") or "—" for r in recs)
-            verdict_lines = "\n".join(
-                ("空炸司令/军长（什么都没吃）" if r["empty"]
-                 else "空炸司令/军长（最大仅吃到连长）") for r in recs)
+            max_lines = max(max_lines, len(recs) * 2)
+            player_lines = []
+            for r in recs:
+                player_lines.append(f"炸方：{r.get('killer_player') or '?'}")
+                player_lines.append(f"被炸方：{r['player']}")
             iid = self.tree.insert("", tk.END, values=(
                 os.path.basename(full_path),
-                "\n".join(r["seat"] for r in recs),
-                "\n".join(r["player"] for r in recs),
-                "\n".join(r["piece"] for r in recs),
-                kills_lines,
-                "\n".join(str(r["death_step"]) for r in recs),
-                kind_lines,
-                verdict_lines,
+                event_blocks(r["seat"] for r in recs),
+                "\n".join(player_lines),
+                event_blocks(r["piece"] for r in recs),
+                event_blocks("、".join(r["kills"]) if r["kills"] else "（无）"
+                             for r in recs),
+                event_blocks(str(r["death_step"]) for r in recs),
+                event_blocks(r.get("kind") or "—" for r in recs),
                 full_path))
             self._row_paths[iid] = full_path
         # 行高随本批最大事件数适配(每行内容纵向居中, 各列逐行对齐)
@@ -4557,7 +4574,8 @@ class QQQuickFilterPanel(ttk.Frame):
 
         mode_text = "什么都没吃" if mode == "none" else "最大仅吃到连长"
         platform_text = "联众" if self._source_var.get() == "联众" else "QQ"
-        status = (f"范围[{platform_text}] 模式[{mode_text}] 扫描 {total} 局，"
+        status = (f"范围[{platform_text}] 筛选[空炸司令/军长] "
+                  f"条件[{mode_text}] 扫描 {total} 局，"
                   f"命中 {len(hit_files)} 局"
                   f" / {len(rows)} 条记录（什么都没吃 {n_empty} 条 ·"
                   f"最大仅吃到连长 {len(rows) - n_empty} 条）")

@@ -1047,11 +1047,18 @@ def trace_jqh_heroes(raw: bytes) -> list[dict]:
     names = decode_jqh_all_usernames(raw)
     block_name_idx = {"红": 0, "绿": 1, "蓝": 2, "黑": 3}
 
-    def die(h, step, kind, by_bomb, side=""):
+    def die(h, step, kind, by_bomb, side="", killer=""):
+        if h["death_kind"] != "在场":
+            return
         h["death_step"] = step
         h["death_kind"] = kind
         h["death_by_bomb"] = by_bomb
         h["bomb_side"] = side
+        h["killer_color"] = killer
+
+    def alive_at(pos):
+        h = hero_at.get(pos)
+        return h if h is not None and h["death_kind"] == "在场" else None
 
     for no, board, ev in _jqh_replay_walk(raw):
         if no == 0:
@@ -1063,7 +1070,7 @@ def trace_jqh_heroes(raw: bytes) -> list[dict]:
                         "name": _JQH_NAME_FULL[ch], "char": ch, "pos": pos,
                         "kills": [], "death_step": None,
                         "death_kind": "在场", "death_by_bomb": False,
-                        "bomb_side": "",
+                        "bomb_side": "", "killer_color": "",
                     }
                     heroes.append(h)
                     hero_at[pos] = h
@@ -1074,8 +1081,8 @@ def trace_jqh_heroes(raw: bytes) -> list[dict]:
                     die(h, no, "清子", False)
         if ev["kind"] != "move":
             continue
-        atk = hero_at.get(ev["start"])
-        dfn = hero_at.get(ev["end"])
+        atk = alive_at(ev["start"])
+        dfn = alive_at(ev["end"])
         res = ev["result"]
         a_name = _JQH_NAME_FULL.get(ev["attacker"][1], "?") if ev["attacker"] else ""
         d_name = _JQH_NAME_FULL.get(ev["target"][1], "?") if ev["target"] else ""
@@ -1105,12 +1112,14 @@ def trace_jqh_heroes(raw: bytes) -> list[dict]:
             if atk:
                 die(atk, no, "被炸弹炸死" if d_name == "炸弹" else "同尽",
                     d_name == "炸弹",
-                    "司/军主动撞炸" if d_name == "炸弹" else "")
+                    "司/军主动撞炸" if d_name == "炸弹" else "",
+                    killer=ev["target"][0] if ev["target"] else "")
                 hero_at.pop(ev["start"], None)
             if dfn:
                 die(dfn, no, "被炸弹炸死" if a_name == "炸弹" else "同尽",
                     a_name == "炸弹",
-                    "炸弹主动空炸" if a_name == "炸弹" else "")
+                    "炸弹主动空炸" if a_name == "炸弹" else "",
+                    killer=ev["attacker"][0] if ev["attacker"] else "")
         elif res == "flag_captured":
             if atk:
                 hero_at.pop(ev["start"], None)
@@ -1127,6 +1136,8 @@ def find_jqh_empty_bomb_victims(raw: bytes, mode: str = "none") -> list[dict]:
     返回字段与 QQ 版 find_empty_bomb_victims 一致。
     """
     out = []
+    names = decode_jqh_all_usernames(raw)
+    block_name_idx = {"红": 0, "绿": 1, "蓝": 2, "黑": 3}
     for h in trace_jqh_heroes(raw):
         if not h["death_by_bomb"]:
             continue
@@ -1135,10 +1146,13 @@ def find_jqh_empty_bomb_victims(raw: bytes, mode: str = "none") -> list[dict]:
                 continue
         elif any(name not in JQH_SMALL_KILL_PIECES for name in h["kills"]):
             continue
+        killer = h.get("killer_color", "")
         out.append({
             "color": h["block"],
             "seat": h["seat"],
             "player": h["player"],
+            "killer_player": (names[block_name_idx[killer]]
+                              if killer in block_name_idx else ""),
             "piece": h["name"],
             "kills": list(h["kills"]),
             "death_step": h["death_step"],

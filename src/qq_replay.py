@@ -1222,6 +1222,7 @@ def find_empty_bomb_victims(replay: QQReplay, mode: str = "none") -> list[dict]:
             "color": h.color,
             "seat": DIR_CN.get(replay.orient.get(h.color, ""), ""),
             "player": replay.players.get(h.color, ""),
+            "killer_player": replay.players.get(h.killer_color, ""),
             "piece": h.name,
             "kills": list(h.kills),
             "death_step": h.death_step,
