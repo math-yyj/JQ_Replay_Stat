@@ -1024,14 +1024,14 @@ def iter_jqh_states(raw: bytes):
 
     首个产出为初始布阵(步号0), 之后每步产出一次; 含认输/扛旗/连跳判负清子。
     状态 dict: {(r,c): (联众色, ItemType)}; 色为解码块色(红/绿/蓝/黑),
-    坐标为"红上/黑左/蓝下/右绿"的联众规范帧(布阵网格旋转180°);
+    坐标为"下红/左绿/上蓝/右黑"的联众规范帧(即布阵网格原生朝向);
     消费方应立即读取, 勿保存引用。
     """
     c2i = get_char_to_itemtype()
     for no, board, _ev in _jqh_replay_walk(raw):
         yield no, {
-            (16 - r, 16 - c): (col, c2i[ch])
-            for (r, c), (col, ch) in board.items()
+            pos: (col, c2i[ch])
+            for pos, (col, ch) in board.items()
         }
 
 
