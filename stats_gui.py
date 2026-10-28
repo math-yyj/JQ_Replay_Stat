@@ -4376,10 +4376,11 @@ HINT_EMPTY_BOMB = (
     "选择（QQ .jgs / 联众 .jqh）。双击结果行打开复盘（等同资源"
     "管理器双击），右键复制完整地址；同局各行操作均指向该复盘。")
 HINT_FAKE_GENERAL = (
-    "装令复盘筛选：先以旅/师/军歼灭对手 团(旅)/旅团(师)/师旅(军) 装大，"
+    "装令/骗炸复盘筛选：先以旅/师/军歼灭对手 团(旅)/旅团(师)/师旅(军) 装大，"
     "其后该子存活期内赚棋（对手在己方司令上折损师/军，或在己方军长上"
     "折损师；B=军时 A 不可为军）或骗炸（该子在己方司令未阵亡时被对手"
-    "炸弹换掉），任一即命中。复盘范围随全局平台选择（QQ .jgs / 联众 "
+    "炸弹换掉，且被炸的不是其幸存棋子中最大/并列最大者），任一即命中。"
+    "复盘范围随全局平台选择（QQ .jgs / 联众 "
     ".jqh）。双击结果行打开复盘，右键复制完整地址；同局各行操作均指向"
     "该复盘。")
 
@@ -4416,7 +4417,7 @@ class QQQuickFilterPanel(ttk.Frame):
             variable=self.filter_var,
             command=self._on_filter_change).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Radiobutton(
-            row0, text="装令复盘筛选", value="fake_general",
+            row0, text="装令/骗炸复盘筛选", value="fake_general",
             variable=self.filter_var,
             command=self._on_filter_change).pack(side=tk.LEFT, padx=(12, 0))
         # 新增筛选模式时在此追加 radio 项(值写入 filter_var)并配对应参数区/结果列
@@ -4650,7 +4651,7 @@ class QQQuickFilterPanel(ttk.Frame):
         ttk.Style(self).configure("Quick.Treeview", rowheight=22)
 
         if filter_key == "fake_general":
-            status = (f"范围[{platform_text}] 筛选[装令复盘] 扫描 {total} 局，"
+            status = (f"范围[{platform_text}] 筛选[装令/骗炸复盘] 扫描 {total} 局，"
                       f"命中 {len(hit_files)} 局 / {len(rows)} 条事件"
                       f"（赚棋 {n_zhuang} 条 · 骗炸 {n_pian} 条）")
         else:

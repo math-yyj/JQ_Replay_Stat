@@ -1242,6 +1242,9 @@ KEY_RANKS = ("旅", "师", "军", "司")
 # 装大触发: A -> 可歼灭的对手子(单字)
 FAKE_TRIGGER_VICTIMS = {"旅": ("团",), "师": ("旅", "团"), "军": ("师", "旅")}
 
+# 关键子大小序(骗炸"非幸存最大"判断用; 雷/弹/旗不参与)
+FAKE_RANK_ORDER = {"旅": 6, "师": 7, "军": 8, "司": 9}
+
 
 def trace_key_pieces(replay: QQReplay) -> list[dict]:
     """追踪四家 旅/师/军/司(单字名), 记录击杀(步, 敌子, 敌色)与阵亡方式。
@@ -1394,8 +1397,17 @@ def match_fake_general(traces: list[dict]) -> list[dict]:
                         if t["rank"] == "司"), None)
             if cmd is not None and (cmd["death_step"] is None
                                     or cmd["death_step"] > death):
-                events.append({"kind": "骗炸", "color": a["color"],
-                               "a": a["rank"], "x": x, "b": None, "y": death})
+                # 骗炸: 被炸的不能是幸存中最大/并列最大(旅/师/军各家唯一,
+                # 无并列; 雷/弹/旗不计) —— 需存在严格更大的幸存子
+                bigger_alive = any(
+                    t is not a
+                    and FAKE_RANK_ORDER.get(t["rank"], 0)
+                        > FAKE_RANK_ORDER.get(a["rank"], 0)
+                    and (t["death_step"] is None or t["death_step"] > death)
+                    for t in by_color.get(a["color"], []))
+                if bigger_alive:
+                    events.append({"kind": "骗炸", "color": a["color"],
+                                   "a": a["rank"], "x": x, "b": None, "y": death})
     return events
 
 
