@@ -4626,6 +4626,9 @@ class GeneralFilterPanel(QQBatchPanel):
                         else QQ_PALETTE)
         if hasattr(self, "_palette_frame"):
             self._build_palette_groups()
+            # 重绘棋盘底色, 使区域底色跟随平台棋子色
+            self._draw_board_base(self.cond_canvas)
+            self._draw_board_base(self.result_canvas)
         self._clear_all()
         self.cond_hover_var.set(self.palette.canonical_text)
         self.status_var.set(
@@ -5216,16 +5219,16 @@ class StatsGUI:
                 self.direction_var.set("逆时针")
 
         # 显示/隐藏平台专属tabs
-        # QQ专属 tabs (index 1, 3, 9, 10)
-        for i in (1, 3, 9, 10):
+        # QQ专属 tabs (index 1, 3)
+        for i in (1, 3):
             self.notebook.tab(i, state="hidden" if is_lianzhong else "normal")
         # 主视角 tab (index 2) 始终隐藏
         self.notebook.tab(2, state="hidden")
         # 联众专属 tabs (index 4, 5, 6)
         for i in (4, 5, 6):
             self.notebook.tab(i, state="normal" if is_lianzhong else "hidden")
-        # 公共 tabs 始终显示 (0=棋子维度, 7=按布阵筛选, 8=条件概率, 11=一键筛选, 12=通用条件统计)
-        for i in (0, 7, 8, 11, 12):
+        # 公共 tabs 始终显示 (0=棋子维度, 7=按布阵筛选, 8=条件概率, 9=一键筛选, 10=通用条件统计)
+        for i in (0, 7, 8, 9, 10):
             self.notebook.tab(i, state="normal")
 
         # 选项卡跳转逻辑:
@@ -5233,14 +5236,11 @@ class StatsGUI:
         # 1.2 联众->QQ，且当前是"颜色统计"(index=4)或"先手方视角"(index=5) -> 切换到"QQ颜色(兼座次)统计"(index=1)
         # 1.3 QQ->联众，且当前是"QQ号码统计"(index=3) -> 切换到"联众ID统计"(index=6)
         # 1.4 联众->QQ，且当前是"联众ID统计"(index=6) -> 切换到"QQ号码统计"(index=3)
-        # 1.5 QQ->联众，且当前是QQ复盘解析/批量统计(9/10) -> 切换到"通用筛选条件统计"(index=12)
         # 其它情况: 如果当前tab被隐藏，跳到棋子维度统计(0)
         if is_lianzhong and current_idx == 1:
             target_idx = 4
         elif is_lianzhong and current_idx == 3:
             target_idx = 6
-        elif is_lianzhong and current_idx in (9, 10):
-            target_idx = 12
         elif not is_lianzhong and current_idx in (4, 5):
             target_idx = 1
         elif not is_lianzhong and current_idx == 6:
@@ -5272,7 +5272,7 @@ class StatsGUI:
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
                      self.layout_filter_panel, self.conditional_panel,
-                     self.qq_batch_panel, self.qq_quick_panel, self.general_panel):
+                     self.qq_quick_panel, self.general_panel):
             panel.clear_stats()
 
     def _on_direction_change(self) -> None:
@@ -5289,7 +5289,7 @@ class StatsGUI:
         for panel in (self.view_panel, self.color_panel, self.qq_panel, self.lz_panel,
                      self.lz_id_panel, self.lz_first_panel, self.piece_panel,
                      self.layout_filter_panel, self.conditional_panel,
-                     self.qq_batch_panel, self.general_panel):
+                     self.general_panel):
             panel._refresh_grid()
 
     def _on_dedup_change(self) -> None:
@@ -5371,21 +5371,15 @@ class StatsGUI:
             is_mainline_getter=self._is_mainline)
         self.notebook.add(self.conditional_panel, text="条件概率筛选")
 
-        # QQ复盘完整解析 (index=9, 仅QQ)
-        self.qq_replay_panel = QQReplayPanel(self.notebook)
-        self.notebook.add(self.qq_replay_panel, text="QQ复盘解析")
+        # QQ复盘完整解析 / QQ复盘批量统计: QQReplayPanel / QQBatchPanel 模块保留,
+        # 主入口不再挂载这两个选项卡(批量统计由通用筛选条件统计覆盖, 单局深看暂不需要)
 
-        # QQ复盘批量统计 (index=10, 仅QQ)
-        self.qq_batch_panel = QQBatchPanel(
-            self.notebook, self.folder_var, display_mode_getter=display_mode_getter)
-        self.notebook.add(self.qq_batch_panel, text="QQ复盘批量统计")
-
-        # 常用模式一键筛选 (index=11, 双平台, 复用全局平台 radio)
+        # 常用模式一键筛选 (index=9, 双平台, 复用全局平台 radio)
         self.qq_quick_panel = QQQuickFilterPanel(
             self.notebook, self.folder_var, self.source_var)
         self.notebook.add(self.qq_quick_panel, text="常用模式一键筛选")
 
-        # 通用筛选条件统计 (index=12, 双平台, 复用全局平台 radio)
+        # 通用筛选条件统计 (index=10, 双平台, 复用全局平台 radio)
         self.general_panel = GeneralFilterPanel(
             self.notebook, self.folder_var, self.source_var,
             display_mode_getter=display_mode_getter)
