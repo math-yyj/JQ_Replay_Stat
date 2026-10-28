@@ -1243,7 +1243,7 @@ KEY_RANKS = ("旅", "师", "军", "司")
 FAKE_TRIGGER_VICTIMS = {"旅": ("团",), "师": ("旅", "团"), "军": ("师", "旅")}
 
 # 关键子大小序(骗炸"非幸存最大"判断用; 雷/弹/旗不参与)
-FAKE_RANK_ORDER = {"旅": 6, "师": 7, "军": 8, "司": 9}
+FAKE_RANK_ORDER = {"团": 5, "旅": 6, "师": 7, "军": 8, "司": 9}
 
 
 def trace_key_pieces(replay: QQReplay) -> list[dict]:
@@ -1356,10 +1356,13 @@ def match_fake_general(traces: list[dict]) -> list[dict]:
     """装令战术匹配: 先装大, 后在存活期内赚棋或骗炸。
 
     返回事件 dict: kind(赚棋/骗炸)/color/a(旅|师|军)/x(装大步)/b(司|军)|None/y(结果步)。
-    规则: A装大歼灭对手 团(旅)/旅团(师)/师旅(军); 其后该子存活期内
+    规则: A装大歼灭对手 团(旅)/旅团(师)/师旅(军)(次级子力 V); 其后该子存活期内
       赚棋: 对手在己方司令上折损师/军(B=司), 或在己方军长上折损师(B=军);
-      骗炸: A 在己方司令未阵亡时被对手炸弹换掉。
+      骗炸: A 在己方司令未阵亡时被对手炸弹换掉, 且 A 非其幸存中最大/并列最大。
     A、B 不同子(B=军 且 A=军 时排除)。
+    窗口纯净性(事件起点有效性): 装大步之后、结果步之前, 对手不得有大于 V 的
+      子力死于己方大棋(真令/军/师, 不含假令 A; 撞雷不算)——即不得出现在
+      己方大棋击杀记录中; 否则该(装大, 结果)配对不成立。
     """
     events: list[dict] = []
     by_color: dict[str, list[dict]] = {}
@@ -1374,25 +1377,40 @@ def match_fake_general(traces: list[dict]) -> list[dict]:
         if trig is None:
             continue
         x = trig[0]
+        v_rank = trig[1]
         death = a["death_step"]
 
         def in_life(y):
             return y > x and (death is None or y <= death)
+
+        def spoiled(y) -> bool:
+            """(x,y) 窗口内对手更大子力是否死于己方大棋(击杀含主动吃与被撞反吃)。"""
+            for b in by_color.get(a["color"], []):
+                if b is a or b["rank"] not in ("师", "军", "司"):
+                    continue
+                for (s, v, c) in b["kills"]:
+                    if (x < s < y and c != a["color"]
+                            and FAKE_RANK_ORDER.get(v, 0)
+                            > FAKE_RANK_ORDER.get(v_rank, 0)):
+                        return True
+            return False
 
         for b in by_color.get(a["color"], []):
             if b is a:
                 continue
             if b["rank"] == "司":
                 for (y, v, c) in b["kills"]:
-                    if c != a["color"] and v in ("师", "军") and in_life(y):
+                    if (c != a["color"] and v in ("师", "军")
+                            and in_life(y) and not spoiled(y)):
                         events.append({"kind": "赚棋", "color": a["color"],
                                        "a": a["rank"], "x": x, "b": "司", "y": y})
             elif b["rank"] == "军" and a["rank"] != "军":
                 for (y, v, c) in b["kills"]:
-                    if c != a["color"] and v == "师" and in_life(y):
+                    if (c != a["color"] and v == "师"
+                            and in_life(y) and not spoiled(y)):
                         events.append({"kind": "赚棋", "color": a["color"],
                                        "a": a["rank"], "x": x, "b": "军", "y": y})
-        if a["death_by_bomb"] and death is not None:
+        if a["death_by_bomb"] and death is not None and not spoiled(death):
             cmd = next((t for t in by_color.get(a["color"], [])
                         if t["rank"] == "司"), None)
             if cmd is not None and (cmd["death_step"] is None
