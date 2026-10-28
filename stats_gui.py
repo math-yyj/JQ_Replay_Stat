@@ -5156,8 +5156,8 @@ class StatsGUI:
             self.notebook.tab(i, state="hidden" if is_lianzhong else "normal")
         # 主视角 tab (index 2) 始终隐藏
         self.notebook.tab(2, state="hidden")
-        # 联众专属 tabs (index 4, 5, 6, 13)
-        for i in (4, 5, 6, 13):
+        # 联众专属 tabs (index 4, 5, 6)
+        for i in (4, 5, 6):
             self.notebook.tab(i, state="normal" if is_lianzhong else "hidden")
         # 公共 tabs 始终显示 (0=棋子维度, 7=按布阵筛选, 8=条件概率, 11=一键筛选, 12=通用条件统计)
         for i in (0, 7, 8, 11, 12):
@@ -5168,21 +5168,18 @@ class StatsGUI:
         # 1.2 联众->QQ，且当前是"颜色统计"(index=4)或"先手方视角"(index=5) -> 切换到"QQ颜色(兼座次)统计"(index=1)
         # 1.3 QQ->联众，且当前是"QQ号码统计"(index=3) -> 切换到"联众ID统计"(index=6)
         # 1.4 联众->QQ，且当前是"联众ID统计"(index=6) -> 切换到"QQ号码统计"(index=3)
-        # 1.5 QQ->联众，且当前是QQ复盘解析/批量统计(9/10) -> 切换到"联众复盘解析"(index=13)
-        # 1.6 联众->QQ，且当前是"联众复盘解析"(index=13) -> 切换到QQ复盘解析(index=9)
+        # 1.5 QQ->联众，且当前是QQ复盘解析/批量统计(9/10) -> 切换到"通用筛选条件统计"(index=12)
         # 其它情况: 如果当前tab被隐藏，跳到棋子维度统计(0)
         if is_lianzhong and current_idx == 1:
             target_idx = 4
         elif is_lianzhong and current_idx == 3:
             target_idx = 6
         elif is_lianzhong and current_idx in (9, 10):
-            target_idx = 13
+            target_idx = 12
         elif not is_lianzhong and current_idx in (4, 5):
             target_idx = 1
         elif not is_lianzhong and current_idx == 6:
             target_idx = 3
-        elif not is_lianzhong and current_idx == 13:
-            target_idx = 9
         else:
             # 检查当前tab是否仍然可见
             try:
@@ -5327,10 +5324,7 @@ class StatsGUI:
             display_mode_getter=display_mode_getter)
         self.notebook.add(self.general_panel, text="通用筛选条件统计")
 
-        # 联众复盘完整解析 (index=13, 仅联众)
-        self.gl_replay_panel = GLReplayPanel(self.notebook)
-        self.notebook.add(self.gl_replay_panel, text="联众复盘解析")
-        self.notebook.tab(13, state="hidden")
+        # 联众复盘完整解析: GLReplayPanel 模块保留, 主入口不再挂载该选项卡
 
         # QQ/联众选项卡对应关系 (用于切换平台时保持位置)
         self._qq_to_lz_tab = {1: 4, 3: 6}  # QQ index -> 联众 index
