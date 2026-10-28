@@ -1046,10 +1046,11 @@ def trace_jqh_heroes(raw: bytes) -> list[dict]:
     names = decode_jqh_all_usernames(raw)
     block_name_idx = {"红": 0, "绿": 1, "蓝": 2, "黑": 3}
 
-    def die(h, step, kind, by_bomb):
+    def die(h, step, kind, by_bomb, side=""):
         h["death_step"] = step
         h["death_kind"] = kind
         h["death_by_bomb"] = by_bomb
+        h["bomb_side"] = side
 
     for no, board, ev in _jqh_replay_walk(raw):
         if no == 0:
@@ -1061,6 +1062,7 @@ def trace_jqh_heroes(raw: bytes) -> list[dict]:
                         "name": _JQH_NAME_FULL[ch], "char": ch, "pos": pos,
                         "kills": [], "death_step": None,
                         "death_kind": "在场", "death_by_bomb": False,
+                        "bomb_side": "",
                     }
                     heroes.append(h)
                     hero_at[pos] = h
@@ -1101,11 +1103,13 @@ def trace_jqh_heroes(raw: bytes) -> list[dict]:
         elif res == "both_die":
             if atk:
                 die(atk, no, "被炸弹炸死" if d_name == "炸弹" else "同尽",
-                    d_name == "炸弹")
+                    d_name == "炸弹",
+                    "司/军主动撞炸" if d_name == "炸弹" else "")
                 hero_at.pop(ev["start"], None)
             if dfn:
                 die(dfn, no, "被炸弹炸死" if a_name == "炸弹" else "同尽",
-                    a_name == "炸弹")
+                    a_name == "炸弹",
+                    "炸弹主动空炸" if a_name == "炸弹" else "")
         elif res == "flag_captured":
             if atk:
                 hero_at.pop(ev["start"], None)
@@ -1138,6 +1142,7 @@ def find_jqh_empty_bomb_victims(raw: bytes, mode: str = "none") -> list[dict]:
             "kills": list(h["kills"]),
             "death_step": h["death_step"],
             "death_kind": h["death_kind"],
+            "kind": h["bomb_side"],
             "empty": not h["kills"],
         })
     return out

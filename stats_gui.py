@@ -4322,6 +4322,7 @@ class QQQuickFilterPanel(ttk.Frame):
         self._source_var = source_var
         self._worker = None
         self._scan_result = None
+        self._row_paths: dict[str, str] = {}
         self.mode_var = tk.StringVar(value="none")
         self.status_var = tk.StringVar(
             value="选择文件夹后点击筛选按钮；四家中任一家命中即计入该局")
@@ -4354,18 +4355,21 @@ class QQQuickFilterPanel(ttk.Frame):
             top,
             text="追踪四家司令/军长的全局吃子记录（含反吃），凡被对手炸弹换掉"
                  "且满足所选条件即命中；“最大仅吃到连长”指击杀仅限连长/排长/工兵"
-                 "（含什么都没吃）。复盘范围随全局平台选择（QQ .jgs / 联众 .jqh）。",
+                 "（含什么都没吃）。复盘范围随全局平台选择（QQ .jgs / 联众 .jqh）。"
+                 "双击结果行打开复盘（等同资源管理器双击），右键复制完整地址。",
             wraplength=760).pack(fill=tk.X, padx=6, pady=(0, 4))
 
         result = ttk.LabelFrame(self, text="命中结果（每行一条：某家司令/军长）")
         result.pack(fill=tk.BOTH, expand=True, padx=2)
 
-        cols = ("file", "seat", "player", "piece", "kills", "step", "verdict")
-        heads = ("文件", "方位", "玩家", "棋子", "击杀记录", "阵亡步", "判定")
-        widths = (230, 50, 150, 60, 175, 70, 310)
+        cols = ("file", "seat", "player", "piece", "kills", "step", "kind",
+                "verdict", "path")
+        heads = ("文件", "方位", "玩家", "棋子", "击杀记录", "阵亡步",
+                 "空炸类型", "判定", "详细地址")
+        widths = (170, 42, 112, 46, 118, 60, 130, 190, 240)
         style = ttk.Style(self)
-        style.configure("Quick.Treeview", font=("Microsoft YaHei UI", 9),
-                        rowheight=24)
+        style.configure("Quick.Treeview", font=("Microsoft YaHei UI", 8),
+                        rowheight=22)
         style.configure("Quick.Treeview.Heading",
                         font=("Microsoft YaHei UI", 9, "bold"))
         self.tree = ttk.Treeview(
@@ -4373,11 +4377,14 @@ class QQQuickFilterPanel(ttk.Frame):
             style="Quick.Treeview")
         for col, head, width in zip(cols, heads, widths):
             self.tree.heading(col, text=head)
-            self.tree.column(col, width=width, anchor="w", stretch=(col == "file"))
+            self.tree.column(col, width=width, anchor="w",
+                             stretch=(col == "path"))
         vsb = ttk.Scrollbar(result, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0), pady=4)
         vsb.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4), pady=4)
+        self.tree.bind("<Double-Button-1>", self._on_tree_open)
+        self.tree.bind("<Button-3>", self._on_tree_context)
 
         ttk.Label(self, textvariable=self.status_var).pack(
             fill=tk.X, pady=(2, 0))
@@ -4407,7 +4414,7 @@ class QQQuickFilterPanel(ttk.Frame):
                         try:
                             raw = open(jqh_file, "rb").read()
                             for rec in find_jqh_empty_bomb_victims(raw, mode):
-                                rows.append((os.path.basename(jqh_file), rec))
+                                rows.append((jqh_file, rec))
                         except Exception:
                             failed += 1
                         progress[0] += 1
@@ -4420,7 +4427,7 @@ class QQQuickFilterPanel(ttk.Frame):
                         try:
                             rep = parse_jgs(jgs_file)
                             for rec in find_empty_bomb_victims(rep, mode):
-                                rows.append((os.path.basename(jgs_file), rec))
+                                rows.append((jgs_file, rec))
                         except Exception:
                             failed += 1
                         progress[0] += 1
@@ -4456,18 +4463,21 @@ class QQQuickFilterPanel(ttk.Frame):
             return
 
         self.tree.delete(*self.tree.get_children())
+        self._row_paths.clear()
         hit_files = set()
         n_empty = 0
-        for filename, rec in rows:
-            hit_files.add(filename)
+        for full_path, rec in rows:
+            hit_files.add(os.path.basename(full_path))
             if rec["empty"]:
                 n_empty += 1
             kills = "、".join(rec["kills"]) if rec["kills"] else "（无）"
             verdict = ("空炸司令/军长（什么都没吃）" if rec["empty"]
                        else "空炸司令/军长（最大仅吃到连长）")
-            self.tree.insert("", tk.END, values=(
-                filename, rec["seat"], rec["player"], rec["piece"],
-                kills, rec["death_step"], verdict))
+            iid = self.tree.insert("", tk.END, values=(
+                os.path.basename(full_path), rec["seat"], rec["player"],
+                rec["piece"], kills, rec["death_step"],
+                rec.get("kind") or "—", verdict, full_path))
+            self._row_paths[iid] = full_path
 
         mode_text = "什么都没吃" if mode == "none" else "最大仅吃到连长"
         platform_text = "联众" if self._source_var.get() == "联众" else "QQ"
@@ -4482,8 +4492,40 @@ class QQQuickFilterPanel(ttk.Frame):
     def clear_stats(self) -> None:
         if hasattr(self, "tree") and self.tree.winfo_exists():
             self.tree.delete(*self.tree.get_children())
+        self._row_paths.clear()
         self.status_var.set("选择文件夹后点击筛选按钮；四家中任一家命中即计入该局")
         self._scan_result = None
+
+    def _on_tree_open(self, event) -> None:
+        """双击结果行打开复盘(等同资源管理器下双击打开/运行)。"""
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        path = self._row_paths.get(iid)
+        if not path:
+            return
+        try:
+            os.startfile(path)
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开复盘: {e}", parent=self._top)
+
+    def _on_tree_context(self, event) -> None:
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="复制完整地址",
+                         command=lambda: self._copy_path(iid))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _copy_path(self, iid: str) -> None:
+        path = self._row_paths.get(iid, "")
+        if not path:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self.status_var.set(f"已复制完整地址: {path}")
 
 
 class GeneralFilterPanel(QQBatchPanel):

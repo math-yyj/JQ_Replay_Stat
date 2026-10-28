@@ -1092,6 +1092,7 @@ class HeroTrace:
     death_kind: str = "在场"
     killer_color: str = ""
     death_by_bomb: bool = False
+    bomb_side: str = ""
 
     @property
     def name(self) -> str:
@@ -1129,11 +1130,13 @@ def trace_heroes(replay: QQReplay) -> list[HeroTrace]:
             if p is None or p.color != h.color or p.piece != h.piece:
                 h.death_kind = "清子"
 
-    def die(h: HeroTrace, step: int, kind: str, by_bomb: bool, killer: str) -> None:
+    def die(h: HeroTrace, step: int, kind: str, by_bomb: bool, killer: str,
+            side: str = "") -> None:
         h.death_step = step
         h.death_kind = kind
         h.death_by_bomb = by_bomb
         h.killer_color = killer
+        h.bomb_side = side
 
     sync()
     for kind, item in replay.seq:
@@ -1183,10 +1186,12 @@ def trace_heroes(replay: QQReplay) -> list[HeroTrace]:
         elif rt == "both":
             if atk:
                 die(atk, move.no, "被炸弹炸死" if d_name == "炸弹" else "同尽",
-                    d_name == "炸弹", resolved.defender or "")
+                    d_name == "炸弹", resolved.defender or "",
+                    "司/军主动撞炸" if d_name == "炸弹" else "")
             if dfn:
                 die(dfn, move.no, "被炸弹炸死" if a_name == "炸弹" else "同尽",
-                    a_name == "炸弹", move.color)
+                    a_name == "炸弹", move.color,
+                    "炸弹主动空炸" if a_name == "炸弹" else "")
         elif rt == "mine":
             if atk:
                 die(atk, move.no, "触雷", False, resolved.defender or "")
@@ -1221,6 +1226,7 @@ def find_empty_bomb_victims(replay: QQReplay, mode: str = "none") -> list[dict]:
             "kills": list(h.kills),
             "death_step": h.death_step,
             "death_kind": h.death_kind,
+            "kind": h.bomb_side,
             "empty": not h.kills,
         })
     return out
