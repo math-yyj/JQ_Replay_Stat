@@ -4375,14 +4375,18 @@ HINT_EMPTY_BOMB = (
     "击杀仅限连长/排长/工兵（含什么都没吃）。复盘范围随全局平台"
     "选择（QQ .jgs / 联众 .jqh）。双击结果行打开复盘（等同资源"
     "管理器双击），右键复制完整地址；同局各行操作均指向该复盘。")
-HINT_FAKE_GENERAL = (
-    "装令/骗炸复盘筛选：先以旅/师/军歼灭对手 团(旅)/旅团(师)/师旅(军) 装大，"
+HINT_ZHUANGLING = (
+    "装令复盘筛选：先以旅/师/军歼灭对手 团(旅)/旅团(师)/师旅(军) 装大，"
     "其后该子存活期内赚棋（对手在己方司令上折损师/军，或在己方军长上"
-    "折损师；B=军时 A 不可为军）或骗炸（该子在己方司令未阵亡时被对手"
-    "炸弹换掉，且被炸的不是其幸存棋子中最大/并列最大者），任一即命中。"
-    "复盘范围随全局平台选择（QQ .jgs / 联众 "
-    ".jqh）。双击结果行打开复盘，右键复制完整地址；同局各行操作均指向"
-    "该复盘。")
+    "折损师；B=军时 A 不可为军）即命中。复盘范围随全局平台选择（QQ .jgs "
+    "/ 联众 .jqh）。双击结果行打开复盘，右键复制完整地址；同局各行操作"
+    "均指向该复盘。")
+HINT_PIANZHA = (
+    "骗炸复盘筛选：先以旅/师/军歼灭对手 团(旅)/旅团(师)/师旅(军) 装大，"
+    "其后该子在己方司令未阵亡时被对手炸弹换掉，且被炸的不是其幸存棋子中"
+    "最大/并列最大者（不计雷/弹/旗），即命中。复盘范围随全局平台选择"
+    "（QQ .jgs / 联众 .jqh）。双击结果行打开复盘，右键复制完整地址；同局"
+    "各行操作均指向该复盘。")
 
 
 class QQQuickFilterPanel(ttk.Frame):
@@ -4417,7 +4421,11 @@ class QQQuickFilterPanel(ttk.Frame):
             variable=self.filter_var,
             command=self._on_filter_change).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Radiobutton(
-            row0, text="装令/骗炸复盘筛选", value="fake_general",
+            row0, text="装令复盘筛选", value="fake_general",
+            variable=self.filter_var,
+            command=self._on_filter_change).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Radiobutton(
+            row0, text="骗炸复盘筛选", value="bomb_bait",
             variable=self.filter_var,
             command=self._on_filter_change).pack(side=tk.LEFT, padx=(12, 0))
         # 新增筛选模式时在此追加 radio 项(值写入 filter_var)并配对应参数区/结果列
@@ -4478,9 +4486,11 @@ class QQQuickFilterPanel(ttk.Frame):
 
     def _on_filter_change(self) -> None:
         """切换筛选模式: 参数区显隐与说明随模式更新(口径互斥, 清空结果)。"""
-        if self.filter_var.get() == "fake_general":
+        key = self.filter_var.get()
+        if key != "empty_bomb":
             self.mode_row.pack_forget()
-            self.hint_label.config(text=HINT_FAKE_GENERAL)
+            self.hint_label.config(
+                text=HINT_ZHUANGLING if key == "fake_general" else HINT_PIANZHA)
         else:
             self.mode_row.pack(fill=tk.X, padx=6, pady=(2, 2),
                                before=self.btn_row)
@@ -4504,7 +4514,9 @@ class QQQuickFilterPanel(ttk.Frame):
             try:
                 rows = []
                 failed = 0
-                if filter_key == "fake_general":
+                if filter_key in ("fake_general", "bomb_bait"):
+                    # 装令=赚棋事件 / 骗炸=骗炸事件, 共用同一战况匹配器
+                    want_kind = "赚棋" if filter_key == "fake_general" else "骗炸"
                     if is_lianzhong:
                         from src.lianzhong import find_jqh_fake_general_events
                         files = sorted(glob.glob(
@@ -4514,7 +4526,8 @@ class QQQuickFilterPanel(ttk.Frame):
                             try:
                                 raw = open(jqh_file, "rb").read()
                                 for ev in find_jqh_fake_general_events(raw):
-                                    rows.append((jqh_file, ev))
+                                    if ev["kind"] == want_kind:
+                                        rows.append((jqh_file, ev))
                             except Exception:
                                 failed += 1
                             progress[0] += 1
@@ -4527,7 +4540,8 @@ class QQQuickFilterPanel(ttk.Frame):
                             try:
                                 rep = parse_jgs(jgs_file)
                                 for ev in find_fake_general_events(rep):
-                                    rows.append((jgs_file, ev))
+                                    if ev["kind"] == want_kind:
+                                        rows.append((jgs_file, ev))
                             except Exception:
                                 failed += 1
                             progress[0] += 1
@@ -4622,15 +4636,11 @@ class QQQuickFilterPanel(ttk.Frame):
             return f"{side}方，{ev['a']}骗炸（{ev['y']}步）"
 
         hit_files = set()
-        n_empty = n_zhuang = n_pian = 0
+        n_empty = 0
         for full_path, recs in grouped.items():
             hit_files.add(os.path.basename(full_path))
             for k, r in enumerate(recs):
-                if filter_key == "fake_general":
-                    if r["kind"] == "赚棋":
-                        n_zhuang += 1
-                    else:
-                        n_pian += 1
+                if filter_key in ("fake_general", "bomb_bait"):
                     values = (os.path.basename(full_path) if k == 0 else "",
                               fake_desc(r), full_path if k == 0 else "")
                 else:
@@ -4650,10 +4660,10 @@ class QQQuickFilterPanel(ttk.Frame):
                 self._row_paths[iid] = full_path
         ttk.Style(self).configure("Quick.Treeview", rowheight=22)
 
-        if filter_key == "fake_general":
-            status = (f"范围[{platform_text}] 筛选[装令/骗炸复盘] 扫描 {total} 局，"
-                      f"命中 {len(hit_files)} 局 / {len(rows)} 条事件"
-                      f"（赚棋 {n_zhuang} 条 · 骗炸 {n_pian} 条）")
+        if filter_key in ("fake_general", "bomb_bait"):
+            name_text = "装令复盘" if filter_key == "fake_general" else "骗炸复盘"
+            status = (f"范围[{platform_text}] 筛选[{name_text}] 扫描 {total} 局，"
+                      f"命中 {len(hit_files)} 局 / {len(rows)} 条事件")
         else:
             mode_text = "什么都没吃" if mode == "none" else "最大仅吃到连长"
             status = (f"范围[{platform_text}] 筛选[空炸司令/军长] "
