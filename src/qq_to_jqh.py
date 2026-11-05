@@ -169,7 +169,9 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
     chain = _encode_chain(plain_moves + tail, buf[0xC7])
     buf[MOVE_START:MOVE_START + len(chain)] = chain
 
-    # ---- 0x1070..: 布阵区(标记组 + 289 格) ----
+    # ---- 0x1070..: 布阵区(种子组 + 289 格) ----
+    # 组结构恒为 [b2+e, b1, b2, b1], b2 = b1^0x13; 黑子 e=-1(首字节=b2-1), 其余 e=0。
+    # 空格沿用前组 b1/b2 但恒写 e=0 形态(跟在黑子后即呈 byte0+1 复制)。
     marker = bytes.fromhex("e5 f6 e5 f6")
     buf[LAYOUT_START:LAYOUT_START + 4] = marker
     prev_group = marker
@@ -180,20 +182,25 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
         qq_r, qq_c = 16 - r, c          # 网格 -> QQ 规范帧(同为上下翻转)
         placed = board.get((qq_r, qq_c))
         if idx in _OUT_SET or placed is None:
-            group = prev_group
+            b1, b2 = prev_group[1], prev_group[2]
+            group = bytes((b2, b1, b2, b1))
         else:
             jqh_color = QQ2JQH_COLOR[placed.color]
             char = PIECE_SHORT[placed.piece]
             code = CHAR_CODE[char]
-            k = JQH_K[jqh_color]
-            b1 = (prev_piece_b1 + code + k) & 0xFF
-            prev_piece_b1 = b1
+            b1 = (prev_piece_b1 + code + JQH_K[jqh_color]) & 0xFF
             if jqh_color == "黑":
-                b0 = b1 ^ 0x10
-                group = bytes((b0, b1, (b0 + 1) & 0xFF, b1))
-            else:
-                b0 = b1 ^ 0x13
-                group = bytes((b0, b1, b0, b1))
+                # 黑方链进位怪癖(base=prev+code+0x2B): (base&3)!=3 不动;
+                # ==3 时 +8, 但 base&7==3 且 base bit3=1 时按 prev bit4 再 ±32。
+                if (b1 & 3) == 3:
+                    if (b1 & 7) == 7 or (b1 & 8) == 0:
+                        b1 = (b1 + 8) & 0xFF
+                    else:
+                        b1 = (b1 + 8 + (32 if prev_piece_b1 & 0x10 else -32)) & 0xFF
+            prev_piece_b1 = b1
+            b2 = b1 ^ 0x13
+            e = -1 if jqh_color == "黑" else 0
+            group = bytes(((b2 + e) & 0xFF, b1, b2, b1))
         buf[LAYOUT_START + 4 * idx:LAYOUT_START + 4 * idx + 4] = group
         prev_group = group
     return bytes(buf)
