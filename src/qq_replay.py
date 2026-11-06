@@ -825,37 +825,40 @@ def resolve_move(move: Move, board: dict[tuple[int, int], BoardPiece]) -> Resolv
     return resolved
 
 
-def _check_defeat_before_move(board: dict[tuple[int, int], BoardPiece], color: str,
-                              alive: dict[str, bool], defeated_at: dict[str, int],
-                              step_no: int) -> None:
-    if alive.get(color) and not _movable_left(board, color):
-        alive[color] = False
-        defeated_at[color] = step_no
-        _remove_all(board, color)
+def _post_move_judgment(board: dict[tuple[int, int], BoardPiece], mover: str,
+                        replay: QQReplay, alive: dict[str, bool],
+                        defeated_at: dict[str, int], step_no: int) -> None:
+    """QQ 口径的行棋后死亡判定(用户裁定 2026-11-06)。
 
+    行棋后按行棋顺序依次判其他存活玩家(被扛旗已在行棋结算, 此处判无棋可走);
+    胜利条件无条件高于无棋判断——敌对联盟全灭则不再判行棋方自身。
+    """
+    from .qq_board import can_act
 
-def _track_turn_skip(move: Move, step_no: int, turn_order: list[str],
-                     alive: dict[str, bool], defeated_at: dict[str, int],
-                     skip_count: dict[str, int], turn_idx: int,
-                     board: dict[tuple[int, int], BoardPiece]) -> int:
-    if not alive.get(move.color) or move.color not in turn_order:
-        return turn_idx
-    target_index = turn_order.index(move.color)
-    count = len(turn_order)
-    for offset in range(1, count + 1):
-        index = (turn_idx + offset) % count
-        if index == target_index:
-            break
-        color = turn_order[index]
-        if not alive.get(color):
+    order = list(replay.turn_order) or list(COLOR_ORDER)
+    n = len(order)
+    start = order.index(mover) if mover in order else n - 1
+    for k in range(1, n + 1):
+        color = order[(start + k) % n]
+        if color == mover or not alive.get(color):
             continue
-        skip_count[color] = skip_count.get(color, 0) + 1
-        if skip_count[color] >= 2:
+        if not can_act(board, color):
             alive[color] = False
             defeated_at[color] = step_no
             _remove_all(board, color)
-    skip_count[move.color] = 0
-    return target_index
+
+    split = _team_split(replay.orient)
+    if split:
+        team_a, team_b = split
+        enemy = team_b if mover in team_a else team_a if mover in team_b else None
+    else:
+        enemy = [c for c in order if c != mover]
+    if enemy and all(not alive.get(c, True) for c in enemy):
+        return
+    if alive.get(mover) and not can_act(board, mover):
+        alive[mover] = False
+        defeated_at[mover] = step_no
+        _remove_all(board, mover)
 
 
 def _team_split(orient: dict[str, str]) -> tuple[list[str], list[str]] | None:
@@ -896,8 +899,6 @@ def _analyze(replay: QQReplay) -> ReplayAnalysis:
     alive = {color: True for color in COLOR_ORDER}
     defeated_at: dict[str, int] = {}
     net = {color: 0 for color in COLOR_ORDER}
-    skip_count = {color: 0 for color in COLOR_ORDER}
-    turn_idx = len(replay.turn_order) - 1
     steps: list[AnalyzedStep] = []
     curve: list[tuple[int, dict[str, int]]] = []
     errors: list[tuple[int, str]] = []
@@ -910,14 +911,13 @@ def _analyze(replay: QQReplay) -> ReplayAnalysis:
             event = item
             color = event.color
             is_timeout = event.code == 2
-            is_defeat = (event.code == 2 and event.b >= 5) or event.code in (3, 4)
+            # 认负(code=3)/超时5次(code=2,b>=5,全局累计)即刻阵亡;
+            # 退出(code=4)仅为标志位(5.1 死者退出无效果, 5.2 逃跑由配对的认负承载死亡)
+            is_defeat = (event.code == 2 and event.b >= 5) or event.code == 3
             if is_defeat and color and alive.get(color):
                 alive[color] = False
                 defeated_at[color] = event.no
                 _remove_all(board, color)
-            if is_timeout and color in replay.turn_order:
-                turn_idx = replay.turn_order.index(color)
-                skip_count[color] = 0
             text = event.text or EVENT_TEXT.get(event.code, "事件")
             if is_timeout and not is_defeat:
                 text = f"超时（累计第 {event.b} 次，尚未判负）"
@@ -935,12 +935,6 @@ def _analyze(replay: QQReplay) -> ReplayAnalysis:
             continue
 
         move = item
-        if alive.get(move.color):
-            _check_defeat_before_move(board, move.color, alive, defeated_at, move.no)
-        turn_idx = _track_turn_skip(
-            move, move.no, replay.turn_order, alive, defeated_at,
-            skip_count, turn_idx, board,
-        )
         resolved = resolve_move(move, board)
         color = move.color
         st = stats[color]
@@ -1054,6 +1048,7 @@ def _analyze(replay: QQReplay) -> ReplayAnalysis:
             net=snapshot(), event_text=resolved.event_text or "",
         ))
         curve.append((move.no, snapshot()))
+        _post_move_judgment(board, move.color, replay, alive, defeated_at, move.no)
 
     for st in stats.values():
         st.net = st.score - st.loss
@@ -1113,8 +1108,6 @@ def trace_heroes(replay: QQReplay) -> list[HeroTrace]:
 
     alive = {color: True for color in COLOR_ORDER}
     defeated_at: dict[str, int] = {}
-    skip_count = {color: 0 for color in COLOR_ORDER}
-    turn_idx = len(replay.turn_order) - 1
 
     def hero_at(pos):
         for h in heroes:
@@ -1143,24 +1136,15 @@ def trace_heroes(replay: QQReplay) -> list[HeroTrace]:
         if kind == "event":
             event = item
             color = event.color
-            is_timeout = event.code == 2
-            is_defeat = (event.code == 2 and event.b >= 5) or event.code in (3, 4)
+            is_defeat = (event.code == 2 and event.b >= 5) or event.code == 3
             if is_defeat and color and alive.get(color):
                 alive[color] = False
                 defeated_at[color] = event.no
                 _remove_all(board, color)
-            if is_timeout and color in replay.turn_order:
-                turn_idx = replay.turn_order.index(color)
-                skip_count[color] = 0
             sync()
             continue
 
         move = item
-        if alive.get(move.color):
-            _check_defeat_before_move(board, move.color, alive, defeated_at, move.no)
-        turn_idx = _track_turn_skip(
-            move, move.no, replay.turn_order, alive, defeated_at,
-            skip_count, turn_idx, board)
         sync()
 
         atk = hero_at(move.start)
@@ -1198,6 +1182,7 @@ def trace_heroes(replay: QQReplay) -> list[HeroTrace]:
         elif rt in ("move", "dig", "flag"):
             if atk:
                 atk.pos = move.end
+        _post_move_judgment(board, move.color, replay, alive, defeated_at, move.no)
         sync()
     return heroes
 
@@ -1266,9 +1251,6 @@ def trace_key_pieces(replay: QQReplay) -> list[dict]:
 
     alive = {color: True for color in COLOR_ORDER}
     defeated_at: dict[str, int] = {}
-    skip_count = {color: 0 for color in COLOR_ORDER}
-    turn_idx = len(replay.turn_order) - 1
-
     def rank_at(pos):
         rec = at.get(pos)
         return rec if rec is not None and rec["death_kind"] == "在场" else None
@@ -1295,24 +1277,15 @@ def trace_key_pieces(replay: QQReplay) -> list[dict]:
         if kind == "event":
             event = item
             color = event.color
-            is_timeout = event.code == 2
-            is_defeat = (event.code == 2 and event.b >= 5) or event.code in (3, 4)
+            is_defeat = (event.code == 2 and event.b >= 5) or event.code == 3
             if is_defeat and color and alive.get(color):
                 alive[color] = False
                 defeated_at[color] = event.no
                 _remove_all(board, color)
-            if is_timeout and color in replay.turn_order:
-                turn_idx = replay.turn_order.index(color)
-                skip_count[color] = 0
             sync()
             continue
 
         move = item
-        if alive.get(move.color):
-            _check_defeat_before_move(board, move.color, alive, defeated_at, move.no)
-        turn_idx = _track_turn_skip(
-            move, move.no, replay.turn_order, alive, defeated_at,
-            skip_count, turn_idx, board)
         sync()
 
         atk = rank_at(move.start)
@@ -1348,6 +1321,7 @@ def trace_key_pieces(replay: QQReplay) -> list[dict]:
         elif rt in ("move", "dig", "flag"):
             if atk:
                 atk["pos"] = move.end
+        _post_move_judgment(board, move.color, replay, alive, defeated_at, move.no)
         sync()
     return traces
 

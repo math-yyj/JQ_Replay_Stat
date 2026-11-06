@@ -610,7 +610,7 @@ def simulate_jqh_game(
 
     规则: 吃子按 glworld _resolve_combat; 行营内子不可被攻击;
           GiveUp=该家认输并清除其子; 扛旗清除被扛方全部子;
-          连跳2次判负清除; 同色落点=违规(不可吃己子)。
+          连跳不判负(超时仅占轮); 同色落点=违规(不可吃己子)。
     违规项: empty(起点无子) / immov(起点雷旗) / own(吃己子) /
             camp(攻击行营内子) / owner(非轮走方行棋)。
     """
@@ -670,7 +670,6 @@ def _walk(moves, cells, fn, camps, flag_cells, direction):
         offset = (cycle.index(first_src[0]) - lead) % len(cycle)
 
     active = set(cycle)
-    skip: dict[str, int] = {c: 0 for c in cycle}
     last_mover = None
     viol_detail: dict[str, int] = {}
     flag_hits = 0
@@ -705,7 +704,6 @@ def _walk(moves, cells, fn, camps, flag_cells, direction):
                 mover = next_turn()
             else:  # Pass
                 if mover is not None:
-                    skip[mover] = 0
                     last_mover = mover
                 mover = next_turn()
             continue
@@ -720,21 +718,8 @@ def _walk(moves, cells, fn, camps, flag_cells, direction):
             bump("immov")
         if mover is not None and src[0] != mover:
             bump("owner")
-        # 跳过判负
-        if last_mover is not None and mover is not None:
-            order = [c for c in cycle]
-            i0 = order.index(last_mover)
-            for step in range(1, len(order)):
-                c = order[(i0 + step) % len(order)]
-                if c == mover:
-                    break
-                if c in active:
-                    skip[c] += 1
-                    if skip[c] >= 2:
-                        out_player(c, "超时判负")
         if mover is not None:
-            skip[mover] = 0
-        last_mover = mover if mover is not None else last_mover
+            last_mover = mover
 
         cells.pop(s, None)
         dst = cells.get(e)
@@ -868,7 +853,7 @@ def _jqh_replay_walk(raw: bytes):
         {'kind':'pass'} / {'kind':'giveup','color'}
       其中 attacker/target 为 (块色,棋子字) 或 None; result ∈
         move/attacker_wins/defender_wins/both_die/flag_captured/error;
-      'cleared': [(块色, 原因)] 记录本步被清子的玩家(认输/连跳判负/扛旗)。
+      'cleared': [(块色, 原因)] 记录本步被清子的玩家(认输/扛旗)。
     轮转方向按开局行棋颜色拟合; 开局 Pass/GiveUp 各占一轮;
     连续两次未行棋判负清子; 扛旗清除被扛方全部子。
     """
@@ -934,7 +919,6 @@ def _jqh_replay_walk(raw: bytes):
 
     idx = offset
     active = set(cycle)
-    skip = {c: 0 for c in cycle}
     last_mover = None
 
     def next_turn():
@@ -965,27 +949,15 @@ def _jqh_replay_walk(raw: bytes):
                 ev = {"kind": "giveup", "color": None, "cleared": cleared}
             else:
                 if mover is not None:
-                    skip[mover] = 0
                     last_mover = mover
                 mover = next_turn()
                 ev = {"kind": "pass", "cleared": cleared}
             yield no, board, ev
             continue
 
-        # 连跳判负
-        if last_mover is not None and mover is not None:
-            i0 = cycle.index(last_mover)
-            for step in range(1, len(cycle)):
-                c = cycle[(i0 + step) % len(cycle)]
-                if c == mover:
-                    break
-                if c in active:
-                    skip[c] += 1
-                    if skip[c] >= 2:
-                        clear_color(c, "超时判负", cleared)
+        # 连跳不判负(联众口径: 超时仅占轮, 无棋可走者轮至时以 GiveUp 记录)
         if mover is not None:
-            skip[mover] = 0
-        last_mover = mover if mover is not None else last_mover
+            last_mover = mover
 
         s = fn(m[0], m[1])
         e = fn(m[2], m[3])
@@ -1022,7 +994,7 @@ def _jqh_replay_walk(raw: bytes):
 def iter_jqh_states(raw: bytes):
     """按行棋顺序推演全局状态, 依次产出 (步号, 状态dict)。
 
-    首个产出为初始布阵(步号0), 之后每步产出一次; 含认输/扛旗/连跳判负清子。
+    首个产出为初始布阵(步号0), 之后每步产出一次; 含认输/扛旗清子。
     状态 dict: {(r,c): (联众色, ItemType)}; 色为解码块色(红/绿/蓝/黑),
     坐标为"下红/左绿/上蓝/右黑"的联众规范帧(即布阵网格原生朝向);
     消费方应立即读取, 勿保存引用。

@@ -139,14 +139,16 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
     entries: list[bytes] = []
     for kind, item in replay.seq:
         if kind == "event":
-            if item is replay.end_event or item.code not in (2, 3, 4):
-                continue                              # 终局标记不是行棋事件
+            # 退出(code=4)仅为标志位(5.1 死者退出无效果, 5.2 逃跑由配对的
+            # 认负事件承载死亡), 终局标记(code=5)同理不入行棋区。
+            if item is replay.end_event or item.code not in (2, 3):
+                continue
             if item.code == 2 and item.b < 5:
                 entries.append(bytes([0xFF]) * 4)     # 超时(未判负)=Pass
                 continue
-            if item.code == 3 and item.color in dead:
+            if item.color and item.color in dead:
                 continue                              # 扛旗后的战败收尾标记
-            entries.append(bytes([0xFE]) * 4)         # 认输/退出/判负=GiveUp
+            entries.append(bytes([0xFE]) * 4)         # 认负/超时判负=GiveUp(阵亡)
             if item.color:
                 dead.add(item.color)
             continue

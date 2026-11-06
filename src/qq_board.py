@@ -182,6 +182,107 @@ def legal_cells(color: str, piece: int) -> set[tuple[int, int]]:
     }
 
 
+def _enterable(board: dict[tuple[int, int], BoardPiece], color: str,
+               cell: tuple[int, int]) -> bool:
+    """该格可否作为落点: 可持子, 且非"被占行营", 且非己子。"""
+    if not (0 <= cell[0] < 17 and 0 <= cell[1] < 17) or not can_hold_piece(*cell):
+        return False
+    occ = board.get(cell)
+    if occ is None:
+        return True
+    if occ.color == color:
+        return False
+    return cell_kind(*cell) != "C"      # 行营内棋子受保护, 不可被攻击
+
+
+def _line_cells(line, cell):
+    kind, fixed, a, b = line
+    if kind == "h":
+        if cell[0] != fixed or not a <= cell[1] <= b:
+            return None
+        return [(fixed, c) for c in range(a, b + 1)]
+    if cell[1] != fixed or not a <= cell[0] <= b:
+        return None
+    return [(r, fixed) for r in range(a, b + 1)]
+
+
+def _rail_scan(cells, start, board, color) -> bool:
+    """沿线滑行: 空可持子格即可停; 敌子(非行营)可吃即停; 被占格挡住。"""
+    i = cells.index(start)
+    for step in (1, -1):
+        j = i + step
+        while 0 <= j < len(cells):
+            cell = cells[j]
+            if not can_hold_piece(*cell):
+                j += step
+                continue
+            occ = board.get(cell)
+            if occ is None:
+                return True
+            if occ.color != color and cell_kind(*cell) != "C":
+                return True
+            break
+    return False
+
+
+def piece_has_legal_move(board: dict[tuple[int, int], BoardPiece], color: str,
+                         pos: tuple[int, int]) -> bool:
+    """该子是否存在至少一个合法落点(高估可动性, 供"无棋可走"判定用)。
+
+    近路按八邻接高估(含斜连/行营对角); 铁路沿线滑行; 工兵按铁路网可转弯。
+    """
+    r, c = pos
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            if _enterable(board, color, (r + dr, c + dc)):
+                return True
+
+    piece = board[pos].piece
+    lines = [ln for ln in RAIL_LINES if _line_cells(ln, pos) is not None]
+    for ln in lines:
+        if _rail_scan(_line_cells(ln, pos), pos, board, color):
+            return True
+
+    if piece == int(ItemType.Gongbing):
+        # 铁路网 BFS(工兵可转弯): 经无子铁路格连通, 落点判定同滑行
+        seen = {pos}
+        frontier = [pos]
+        while frontier:
+            cur = frontier.pop()
+            for ln in RAIL_LINES:
+                cells = _line_cells(ln, cur)
+                if cells is None:
+                    continue
+                i = cells.index(cur)
+                for j in (i - 1, i + 1):
+                    if not 0 <= j < len(cells):
+                        continue
+                    cell = cells[j]
+                    if cell in seen:
+                        continue
+                    if not can_hold_piece(*cell):
+                        seen.add(cell)
+                        frontier.append(cell)
+                        continue
+                    occ = board.get(cell)
+                    if occ is None or (occ.color != color and cell_kind(*cell) != "C"):
+                        return True
+                    seen.add(cell)      # 被占格止步
+        return False
+    return False
+
+
+def can_act(board: dict[tuple[int, int], BoardPiece], color: str) -> bool:
+    """"无棋可走"判定(三情形): 无子/仅剩地雷军旗/存活子均无合法落点。"""
+    return any(
+        p.color == color and p.piece not in (int(ItemType.Dilei), int(ItemType.Junqi))
+        and piece_has_legal_move(board, color, pos)
+        for pos, p in board.items()
+    )
+
+
 def rotate_cw(row: int, col: int, times: int) -> tuple[int, int]:
     for _ in range(times % 4):
         row, col = col, 16 - row
@@ -232,19 +333,13 @@ def iter_states(replay, board: dict[tuple[int, int], BoardPiece],
 
     首个产出是初始布阵（步号 0）；之后每处理一步棋/事件产出一次。
     产出的棋盘对象会被后续步骤原地修改，消费方应立即读取，不要保存引用。
-    推演包含战败清子、连续两次未行棋判负、无子可动判负与扛旗清子。
+    死亡口径同 QQ 裁定(2026-11-06): 认负/超时5次/扛旗即刻阵亡,
+    退出仅为标志位; 行棋后判无棋可走(他家先行棋顺序, 胜利优先, 再判行棋方)。
     """
-    turn_order = list(getattr(replay, "turn_order", ()) or ())
-    turn_idx = len(turn_order) - 1
-    skip_count = {color: 0 for color in SEAT_COLORS}
-    alive = {color: True for color in SEAT_COLORS}
+    from .qq_replay import _post_move_judgment
 
-    def movable_left(color: str) -> bool:
-        return any(
-            piece.color == color
-            and piece.piece not in (int(ItemType.Dilei), int(ItemType.Junqi))
-            for piece in board.values()
-        )
+    alive = {color: True for color in SEAT_COLORS}
+    defeated_at: dict[str, int] = {}
 
     def defeat(color: str | None) -> None:
         if color and alive.get(color):
@@ -254,32 +349,9 @@ def iter_states(replay, board: dict[tuple[int, int], BoardPiece],
     yield 0, board
     for kind, item in replay.seq:
         if kind == "event":
-            is_defeat = item.code in (3, 4) or (
-                item.code == 2 and item.b >= 5)
-            if is_defeat:
+            if item.code == 3 or (item.code == 2 and item.b >= 5):
                 defeat(item.color)
-            if item.code == 2 and item.color in turn_order:
-                turn_idx = turn_order.index(item.color)
-                skip_count[item.color] = 0
         else:
-            if alive.get(item.color) and not movable_left(item.color):
-                defeat(item.color)
-            if alive.get(item.color) and item.color in turn_order:
-                target_idx = turn_order.index(item.color)
-                count = len(turn_order)
-                for offset in range(1, count + 1):
-                    index = (turn_idx + offset) % count
-                    if index == target_idx:
-                        break
-                    color = turn_order[index]
-                    if not alive.get(color):
-                        continue
-                    skip_count[color] = skip_count.get(color, 0) + 1
-                    if skip_count[color] >= 2:
-                        defeat(color)
-                skip_count[item.color] = 0
-                turn_idx = target_idx
-
             start = rotate_cw(item.start[0], item.start[1], times)
             end = rotate_cw(item.end[0], item.end[1], times)
             move = Move(
@@ -292,5 +364,7 @@ def iter_states(replay, board: dict[tuple[int, int], BoardPiece],
             )
             resolved = resolve_move(move, board)
             if resolved.type == "flag" and resolved.defender:
-                alive[resolved.defender] = False
+                defeat(resolved.defender)
+            _post_move_judgment(board, item.color, replay, alive, defeated_at,
+                                item.no)
         yield item.no, board
