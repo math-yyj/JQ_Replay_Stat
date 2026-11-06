@@ -5,14 +5,16 @@
   - 0x00-0x23  头部: GL 魔数 + ctime 风格日期串;
   - 0x24-0x63  简介明文(GBK, NUL 填充): "win.  sp <名>. time 00:00:00. rule SMS. step N";
   - 0x64-0xB3  四家用户名 [红,绿,蓝,黑] ×20B, XOR 累积链(首字节明文);
-  - 0xB4-0xC7  子链(零明文), 0xB8 承载主视角色索引(红0/绿1/蓝2/黑3);
+  - 0xB4-0xC7  子链, 明文 [0x04,0,0,0, 主视角,0,0,0, 首手,0...],
+               0xB8 主视角色索引(红0/绿1/蓝2/黑3), 0xBC 首手方索引;
   - 0xC8-      行棋区: LE32 步数 + N×4B 四元组 + 哨兵(Pass=FF×4, GiveUp=FE×4),
                链式编码 raw[i]=((plain[i]+raw[i-1])&0xFF)^0x13, prev 从 raw[0xC7] 起;
   - 移动区后-0x106F 零明文链(呈周期2常量);
-  - 0x1070-0x14F7 布阵区 290×4B = 标记组 + 289 格(17×17, 组 i ↔ 格 i-1):
-               空格=复制前组; 棋子组 b1=(前棋子b1+code+K)&0xFF, 红/绿/蓝
-               [b0,b1,b0,b1](b0=b1^0x13, K=0x00/0x64/0xC8), 黑
-               [b0,b1,b0+1,b1](b0=b1^0x10, K=0x2B)。
+  - 0x1070-0x14F7 布阵区 290×4B = 种子组 + 289 格(17×17, 组 i ↔ 格 i-1):
+               组恒为 [b2+e, b1, b2, b1], b2=b1^0x13, 黑子 e=-1, 其余 e=0;
+               棋子 b1=(前棋子b1+code+K)&0xFF, 红/绿/蓝 K=0x00/0x64/0xC8,
+               黑 K=0x2B 且 (base&3)==3 时 +8(base&7==3 且 bit3=1 再按 prev bit4 ±32);
+               空格沿用前组 b1/b2 恒写 e=0 形态。
 坐标: QQ 规范帧 --(上下翻转 (16-r,c))--> 联众网格 --(转置 (c,r))--> 存储四元组。
 颜色对应(用户裁定): QQ 黄=联众红, 紫=绿, 绿=蓝, 蓝=黑。
 """
@@ -84,7 +86,8 @@ def _fq(r: int, c: int) -> tuple[int, int]:
 
 
 def convert_qq_to_jqh(replay: QQReplay, template: bytes,
-                      timestamp: float | None = None) -> bytes:
+                      timestamp: float | None = None,
+                      sentinel_shift: int = 0) -> bytes:
     """把 QQ 复盘转换为联众 .JQH 字节串(以 template 提供常量区字节)。"""
     if len(template) != JQH_SIZE:
         raise ValueError(f"template 需为 {JQH_SIZE} 字节, 实际 {len(template)}")
@@ -119,12 +122,28 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
         names80[slot * 20:slot * 20 + len(raw_name)] = raw_name
     buf[0x64:0xB4] = _encode_names(bytes(names80))
 
-    # ---- 0xB4..0xC7: 零明文子链, 0xB8 = 主视角色索引 ----
+    # ---- 0xB4..0xC7: 子链, 明文 [04,0,0,0, 主视角,0,0,0, 首手,0...] ----
+    # 原生格式(200 对实测): 0xB4=0x04 四家标记, 0xB8=主视角色索引,
+    # 0xBC=首手方索引; 0xB4 写杂值会使官方复盘器错位解析子链,
+    # 轮次锚点整体偏一家(GiveUp 归属错后一槽)。
     my_idx = JQH_COLOR_INDEX[QQ2JQH_COLOR.get(replay.my_color or "", "红")]
-    buf[0xB4] = 0x09
-    for i in range(0xB5, 0xC8):
-        plain = my_idx if i == 0xB8 else 0
-        buf[i] = ((buf[i - 1] + plain) & 0xFF) ^ 0x13
+    first_idx = my_idx
+    for kind, item in replay.seq:
+        if kind == "event":
+            if item is replay.end_event or item.code not in (2, 3):
+                continue
+        elif item.tag in ("反弹", "交换"):
+            continue
+        first_idx = JQH_COLOR_INDEX[QQ2JQH_COLOR.get(item.color or "", "红")]
+        break
+    sub_plain = [0] * 20
+    sub_plain[0] = 0x04
+    sub_plain[4] = my_idx
+    sub_plain[8] = first_idx
+    prev = buf[0xB3]
+    for k, v in enumerate(sub_plain):
+        buf[0xB4 + k] = ((prev + v) & 0xFF) ^ 0x13
+        prev = buf[0xB4 + k]
 
     # ---- 行棋区: 序列 -> 四元组/哨兵 ----
     # 先据 QQ 推演建立死亡时间线: 军旗被扛即时出局; code=3 事件若为
@@ -159,6 +178,17 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
         gr1, gc1 = _fq(*s)
         gr2, gc2 = _fq(*e)
         entries.append(bytes((gc1, gr1, gc2, gr2)))   # 存储为 (列,行,列,行)
+
+    # 对照实验: GiveUp 哨兵整体位移(-1=前移一条, +1=后移一条),
+    # 用于适配官方复盘器的轮次归属模型
+    if sentinel_shift:
+        gu = bytes([0xFE]) * 4
+        idxs = [i for i, e in enumerate(entries) if e == gu]
+        for i in (reversed(idxs) if sentinel_shift > 0 else idxs):
+            j = i + sentinel_shift
+            if 0 <= j < len(entries):
+                entries.pop(i)
+                entries.insert(j, gu)
 
     intro = (f"{verdict}  sp {my_name}. time 00:00:00. "
              f"rule SMS. step {len(entries)}")
@@ -210,7 +240,8 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
 
 def convert_jgs_file(jgs_path: str | os.PathLike,
                      out_path: str | os.PathLike | None = None,
-                     template_path: str | os.PathLike | None = None) -> dict:
+                     template_path: str | os.PathLike | None = None,
+                     sentinel_shift: int = 0) -> dict:
     """转换单个 .jgs 为 .JQH, 返回自校验摘要 dict。"""
     from .lianzhong import (decode_jqh_all_usernames, decode_jqh_main_color,
                             jqh_global_pieces, parse_jqh_moves_raw)
@@ -223,7 +254,8 @@ def convert_jgs_file(jgs_path: str | os.PathLike,
     template = open(template_path, "rb").read()
     replay = parse_jgs(jgs_path)
     data = convert_qq_to_jqh(replay, template,
-                             timestamp=os.path.getmtime(jgs_path))
+                             timestamp=os.path.getmtime(jgs_path),
+                             sentinel_shift=sentinel_shift)
     if out_path is None:
         out_path = os.path.splitext(jgs_path)[0] + ".JQH"
     out_path = os.fspath(out_path)
