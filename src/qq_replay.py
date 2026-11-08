@@ -137,6 +137,7 @@ class ResolvedMove:
     def_piece: int | None = None
     defender: str | None = None
     error: bool = False
+    flag_down: bool = False   # 敌方军旗被毁/被扛(含炸弹撞旗同尽), 被扛方即刻阵亡
 
 
 @dataclass
@@ -765,6 +766,17 @@ def resolve_move(move: Move, board: dict[tuple[int, int], BoardPiece]) -> Resolv
         del board[move.start]
         board.pop(move.end, None)
         resolved.desc = f"同尽（{a_name}vs{d_name}）"
+        if d_name == "军旗":
+            # 炸弹撞旗: 同尽 + 扛旗(QQ 复盘以 code=3 b=1 收尾事件佐证),
+            # 被扛方即刻全灭
+            resolved.flag_down = True
+            resolved.event_cat = "扛旗"
+            resolved.severity = 3
+            resolved.event_text = (f"{attacker.color}方{a_name}炸掉"
+                                   f"{defender_color}方军旗，{defender_color}方战败")
+            if defender_color:
+                _remove_all(board, defender_color)
+            return resolved
         if a_name == "炸弹":
             resolved.event_cat = "炸杀"
             resolved.severity = 3
@@ -812,6 +824,7 @@ def resolve_move(move: Move, board: dict[tuple[int, int], BoardPiece]) -> Resolv
         return resolved
 
     if result_type == "flag":
+        resolved.flag_down = True
         del board[move.start]
         board[move.end] = BoardPiece(attacker.color, attack)
         resolved.desc = f"扛旗！夺得{defender_color}方军旗"
@@ -827,38 +840,39 @@ def resolve_move(move: Move, board: dict[tuple[int, int], BoardPiece]) -> Resolv
 
 def _post_move_judgment(board: dict[tuple[int, int], BoardPiece], mover: str,
                         replay: QQReplay, alive: dict[str, bool],
-                        defeated_at: dict[str, int], step_no: int) -> None:
+                        defeated_at: dict[str, int], step_no: int,
+                        death_order: dict[str, int] | None = None,
+                        apply: bool = True) -> list[str]:
     """QQ 口径的行棋后死亡判定(用户裁定 2026-11-06)。
 
-    行棋后按行棋顺序依次判其他存活玩家(被扛旗已在行棋结算, 此处判无棋可走);
-    胜利条件无条件高于无棋判断——敌对联盟全灭则不再判行棋方自身。
+    行棋后按行棋顺序依次判其他存活玩家(被扛旗已在行棋结算, 此处判无棋可走),
+    再判行棋方自身; 死亡登记无条件全落账(胜利归属不豁免同步死亡),
+    判定次序固定"对手在前、行棋方在后"(同尽时先手出击方所在联盟胜)。
+    apply=False 时只侦测不落账(供转换器先发哨兵再清场)。
+    返回按判定次序排列的阵亡颜色列表。
     """
     from .qq_board import can_act
 
     order = list(replay.turn_order) or list(COLOR_ORDER)
     n = len(order)
     start = order.index(mover) if mover in order else n - 1
+    deaths: list[str] = []
     for k in range(1, n + 1):
         color = order[(start + k) % n]
         if color == mover or not alive.get(color):
             continue
         if not can_act(board, color):
+            deaths.append(color)
+    if alive.get(mover) and not can_act(board, mover):
+        deaths.append(mover)
+    if apply:
+        for color in deaths:
             alive[color] = False
             defeated_at[color] = step_no
             _remove_all(board, color)
-
-    split = _team_split(replay.orient)
-    if split:
-        team_a, team_b = split
-        enemy = team_b if mover in team_a else team_a if mover in team_b else None
-    else:
-        enemy = [c for c in order if c != mover]
-    if enemy and all(not alive.get(c, True) for c in enemy):
-        return
-    if alive.get(mover) and not can_act(board, mover):
-        alive[mover] = False
-        defeated_at[mover] = step_no
-        _remove_all(board, mover)
+            if death_order is not None:
+                death_order[color] = len(death_order)
+    return deaths
 
 
 def _team_split(orient: dict[str, str]) -> tuple[list[str], list[str]] | None:
@@ -870,7 +884,8 @@ def _team_split(orient: dict[str, str]) -> tuple[list[str], list[str]] | None:
 
 
 def _decide_winner(replay: QQReplay, alive: dict[str, bool],
-                   defeated_at: dict[str, int]) -> tuple[list[str] | None, str]:
+                   defeated_at: dict[str, int],
+                   death_order: dict[str, int] | None = None) -> tuple[list[str] | None, str]:
     split = _team_split(replay.orient)
     if split:
         team_a, team_b = split
@@ -883,8 +898,17 @@ def _decide_winner(replay: QQReplay, alive: dict[str, bool],
         if len(out_a) == 2 and len(out_b) == 2:
             last_a = max(defeated_at.get(c, 0) for c in team_a)
             last_b = max(defeated_at.get(c, 0) for c in team_b)
+            winners = None
             if last_a != last_b:
                 winners = team_a if last_a > last_b else team_b
+            elif death_order:
+                # 同尽(同一判定时点): 对手先判负, 行棋方后判,
+                # 判定次序在后者所在联盟胜(先手出击方胜)
+                order_a = max(death_order.get(c, -1) for c in team_a)
+                order_b = max(death_order.get(c, -1) for c in team_b)
+                if order_a != order_b:
+                    winners = team_a if order_a > order_b else team_b
+            if winners:
                 return winners, "、".join(replay.players.get(c, c) for c in winners) + " 胜"
     if replay.end_event and replay.end_event.b == 2:
         return None, "和局"
@@ -898,6 +922,7 @@ def _analyze(replay: QQReplay) -> ReplayAnalysis:
     stats = {color: PlayerStats(color) for color in COLOR_ORDER}
     alive = {color: True for color in COLOR_ORDER}
     defeated_at: dict[str, int] = {}
+    death_order: dict[str, int] = {}
     net = {color: 0 for color in COLOR_ORDER}
     steps: list[AnalyzedStep] = []
     curve: list[tuple[int, dict[str, int]]] = []
@@ -917,6 +942,7 @@ def _analyze(replay: QQReplay) -> ReplayAnalysis:
             if is_defeat and color and alive.get(color):
                 alive[color] = False
                 defeated_at[color] = event.no
+                death_order[color] = len(death_order)
                 _remove_all(board, color)
             text = event.text or EVENT_TEXT.get(event.code, "事件")
             if is_timeout and not is_defeat:
@@ -1033,9 +1059,11 @@ def _analyze(replay: QQReplay) -> ReplayAnalysis:
             st.flag += 1
             st.captured.append({"step": move.no, "piece": "军旗",
                                 "color": defender, "kind": "扛"})
-            if defender and alive.get(defender):
-                alive[defender] = False
-                defeated_at[defender] = move.no
+
+        if resolved.flag_down and defender and alive.get(defender):
+            alive[defender] = False
+            defeated_at[defender] = move.no
+            death_order[defender] = len(death_order)
 
         if result_type in COMBAT_TYPES:
             st.exchanges += 1
@@ -1048,12 +1076,13 @@ def _analyze(replay: QQReplay) -> ReplayAnalysis:
             net=snapshot(), event_text=resolved.event_text or "",
         ))
         curve.append((move.no, snapshot()))
-        _post_move_judgment(board, move.color, replay, alive, defeated_at, move.no)
+        _post_move_judgment(board, move.color, replay, alive, defeated_at,
+                            move.no, death_order)
 
     for st in stats.values():
         st.net = st.score - st.loss
 
-    winner, result_text = _decide_winner(replay, alive, defeated_at)
+    winner, result_text = _decide_winner(replay, alive, defeated_at, death_order)
     return ReplayAnalysis(
         stats=stats,
         steps=steps,

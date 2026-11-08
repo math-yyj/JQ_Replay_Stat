@@ -363,7 +363,7 @@ def iter_states(replay, board: dict[tuple[int, int], BoardPiece],
                 tag=item.tag,
             )
             resolved = resolve_move(move, board)
-            if resolved.type == "flag" and resolved.defender:
+            if resolved.flag_down and resolved.defender:
                 defeat(resolved.defender)
             _post_move_judgment(board, item.color, replay, alive, defeated_at,
                                 item.no)

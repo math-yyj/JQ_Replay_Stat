@@ -27,7 +27,9 @@ import time
 
 from .jgs_types import ItemType
 from .qq_board import normalize_board, rotation_times, rotate_cw
-from .qq_replay import PIECE_SHORT, QQReplay, parse_jgs
+from .qq_replay import (PIECE_SHORT, Move, QQReplay, _auto_result,
+                        _post_move_judgment, _remove_all, _tag_type, parse_jgs,
+                        resolve_move)
 
 JQH_SIZE = 5368
 MOVE_START = 0xC8
@@ -85,9 +87,43 @@ def _fq(r: int, c: int) -> tuple[int, int]:
     return 16 - r, c
 
 
+def _fit_move_times(replay: QQReplay,
+                    board: dict[tuple[int, int], "BoardPiece"],
+                    times: int | None) -> int:
+    """实证拟合走子帧相对规范帧的旋转次数。
+
+    常规局走子帧=布阵帧(偏移 0); 个别老二人局(orient 旋转 180°)的走子
+    记录在规范帧, 差半圈。以"空起点最少、tag 与子力裁决最一致"择优,
+    平局维持 times。
+    """
+    best_key: tuple | None = None
+    best_tm = times or 0
+    for tm in range(4):
+        b = {k: v for k, v in board.items()}
+        empty = mism = 0
+        for kind, item in replay.seq:
+            if kind != "move":
+                continue
+            s = rotate_cw(item.start[0], item.start[1], tm)
+            e = rotate_cw(item.end[0], item.end[1], tm)
+            a = b.get(s)
+            if a is None:
+                empty += 1
+                continue
+            t = b.get(e)
+            if t is not None and item.tag:
+                if (_tag_type(item.tag) or "?") != _auto_result(a.piece, t.piece):
+                    mism += 1
+            resolve_move(Move(no=item.no, color=a.color, start=s, end=e,
+                              result=item.result, tag=item.tag), b)
+        key = (empty, mism, 0 if tm == (times or 0) else 1)
+        if best_key is None or key < best_key:
+            best_key, best_tm = key, tm
+    return best_tm
+
+
 def convert_qq_to_jqh(replay: QQReplay, template: bytes,
-                      timestamp: float | None = None,
-                      sentinel_shift: int = 0) -> bytes:
+                      timestamp: float | None = None) -> bytes:
     """把 QQ 复盘转换为联众 .JQH 字节串(以 template 提供常量区字节)。"""
     if len(template) != JQH_SIZE:
         raise ValueError(f"template 需为 {JQH_SIZE} 字节, 实际 {len(template)}")
@@ -95,6 +131,7 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
     board = normalize_board(replay.board, replay.orient)
     if times is None or board is None:
         raise ValueError("方位无法归一, 不支持转换")
+    move_times = _fit_move_times(replay, board, times)
 
     buf = bytearray(template)
 
@@ -134,6 +171,11 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
                 continue
         elif item.tag in ("反弹", "交换"):
             continue
+        else:
+            piece = board.get(rotate_cw(item.start[0], item.start[1], move_times))
+            if piece is not None:
+                first_idx = JQH_COLOR_INDEX[QQ2JQH_COLOR[piece.color]]
+                break
         first_idx = JQH_COLOR_INDEX[QQ2JQH_COLOR.get(item.color or "", "红")]
         break
     sub_plain = [0] * 20
@@ -145,50 +187,85 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
         buf[0xB4 + k] = ((prev + v) & 0xFF) ^ 0x13
         prev = buf[0xB4 + k]
 
-    # ---- 行棋区: 序列 -> 四元组/哨兵 ----
-    # 先据 QQ 推演建立死亡时间线: 军旗被扛即时出局; code=3 事件若为
-    # "军旗被扛,战败" 的收尾标记(玩家已死)则不再发哨兵(死亡由行棋推出)。
-    analysis = replay.analyze()
-    dead: set[str] = set()
-    for step in analysis.steps:
-        if step.kind == "move" and step.resolved is not None \
-                and step.resolved.type == "flag" and step.resolved.defender:
-            dead.add(step.resolved.defender)
-
+    # ---- 行棋区: QQ 流 -> 联众条目(轮次槽位对齐) ----
+    # 联众条目逐槽占轮(走子自证行棋方, 哨兵靠轮转归属), 而 QQ 的
+    # "行棋后即时判亡"在联众只能以死者自身槽位的 GiveUp 表达。翻译规则
+    # (用户裁定 2026-11-06 三类枚举): 死亡登记保持 QQ 原位(其后任何真实
+    # 行棋之前), GiveUp 落死者自身轮次槽, 途中/尾部空槽以 Pass 填充;
+    # 扛旗即时清子不发哨兵(死者槽位由轮转跳过); 超时5次判负=自己行棋
+    # 时刻认负, 零填充; 退出(code=4)纯标志位不入行棋区。
+    PASS = bytes([0xFF]) * 4
+    GIVEUP = bytes([0xFE]) * 4
+    # 二人局等非满员局: 轮转只在参战家之间循环; 行棋方一律以起点棋子
+    # 真色为准(部分老复盘的 move.color 字段与实际参战色不一致)
+    participants = {p.color for p in board.values()}
+    order = [c for c in (replay.turn_order or ["黄", "紫", "绿", "蓝"])
+             if c in participants] or ["黄", "紫", "绿", "蓝"]
+    alive = {c: c in participants for c in ["黄", "紫", "绿", "蓝"]}
+    defeated_at: dict[str, int] = {}
+    death_order: dict[str, int] = {}
+    walk_board = dict(board)
     entries: list[bytes] = []
+    slot_ptr = 0
+
+    def next_owner() -> str | None:
+        nonlocal slot_ptr
+        for _ in range(len(order) + 1):
+            color = order[slot_ptr % len(order)]
+            slot_ptr += 1
+            if alive.get(color):
+                return color
+        return None
+
+    def emit_at(target: str | None, entry: bytes) -> None:
+        """entry 落到 target 自身轮次槽, 途中存活家逐槽填 Pass。"""
+        while target and alive.get(target):
+            owner = next_owner()
+            if owner is None:
+                return
+            if owner == target:
+                entries.append(entry)
+                return
+            entries.append(PASS)
+
+    def die(color: str, step_no: int) -> None:
+        alive[color] = False
+        defeated_at[color] = step_no
+        death_order[color] = len(death_order)
+        _remove_all(walk_board, color)
+
     for kind, item in replay.seq:
         if kind == "event":
-            # 退出(code=4)仅为标志位(5.1 死者退出无效果, 5.2 逃跑由配对的
-            # 认负事件承载死亡), 终局标记(code=5)同理不入行棋区。
+            color = item.color
             if item is replay.end_event or item.code not in (2, 3):
                 continue
             if item.code == 2 and item.b < 5:
-                entries.append(bytes([0xFF]) * 4)     # 超时(未判负)=Pass
+                emit_at(color, PASS)          # 超时占轮
                 continue
-            if item.color and item.color in dead:
-                continue                              # 扛旗后的战败收尾标记
-            entries.append(bytes([0xFE]) * 4)         # 认负/超时判负=GiveUp(阵亡)
-            if item.color:
-                dead.add(item.color)
+            if not color or not alive.get(color):
+                continue                      # 扛旗收尾标记/重复记录
+            emit_at(color, GIVEUP)            # 认负/超时5次判负: 自身槽位出局
+            die(color, item.no)
             continue
-        if item.tag == "反弹" or item.tag == "交换":
-            continue                                  # 非生效步, 目标格式无对应
-        s = rotate_cw(item.start[0], item.start[1], times)
-        e = rotate_cw(item.end[0], item.end[1], times)
+        if item.tag in ("反弹", "交换"):
+            continue                          # 非生效步, 无对应条目
+        s = rotate_cw(item.start[0], item.start[1], move_times)
+        e = rotate_cw(item.end[0], item.end[1], move_times)
+        mover = walk_board.get(s)
+        mover_color = mover.color if mover else item.color
         gr1, gc1 = _fq(*s)
         gr2, gc2 = _fq(*e)
-        entries.append(bytes((gc1, gr1, gc2, gr2)))   # 存储为 (列,行,列,行)
-
-    # 对照实验: GiveUp 哨兵整体位移(-1=前移一条, +1=后移一条),
-    # 用于适配官方复盘器的轮次归属模型
-    if sentinel_shift:
-        gu = bytes([0xFE]) * 4
-        idxs = [i for i, e in enumerate(entries) if e == gu]
-        for i in (reversed(idxs) if sentinel_shift > 0 else idxs):
-            j = i + sentinel_shift
-            if 0 <= j < len(entries):
-                entries.pop(i)
-                entries.insert(j, gu)
+        emit_at(mover_color, bytes((gc1, gr1, gc2, gr2)))
+        move = Move(no=item.no, color=mover_color, start=s, end=e,
+                    result=item.result, tag=item.tag)
+        resolved = resolve_move(move, walk_board)
+        if resolved.flag_down and resolved.defender:
+            die(resolved.defender, item.no)   # 扛旗即时阵亡, 不发哨兵
+        for died in _post_move_judgment(walk_board, mover_color, replay,
+                                        alive, defeated_at, item.no,
+                                        death_order, apply=False):
+            emit_at(died, GIVEUP)             # 无棋可走: 死者自身槽位出局
+            die(died, item.no)
 
     intro = (f"{verdict}  sp {my_name}. time 00:00:00. "
              f"rule SMS. step {len(entries)}")
@@ -240,8 +317,7 @@ def convert_qq_to_jqh(replay: QQReplay, template: bytes,
 
 def convert_jgs_file(jgs_path: str | os.PathLike,
                      out_path: str | os.PathLike | None = None,
-                     template_path: str | os.PathLike | None = None,
-                     sentinel_shift: int = 0) -> dict:
+                     template_path: str | os.PathLike | None = None) -> dict:
     """转换单个 .jgs 为 .JQH, 返回自校验摘要 dict。"""
     from .lianzhong import (decode_jqh_all_usernames, decode_jqh_main_color,
                             jqh_global_pieces, parse_jqh_moves_raw)
@@ -254,8 +330,7 @@ def convert_jgs_file(jgs_path: str | os.PathLike,
     template = open(template_path, "rb").read()
     replay = parse_jgs(jgs_path)
     data = convert_qq_to_jqh(replay, template,
-                             timestamp=os.path.getmtime(jgs_path),
-                             sentinel_shift=sentinel_shift)
+                             timestamp=os.path.getmtime(jgs_path))
     if out_path is None:
         out_path = os.path.splitext(jgs_path)[0] + ".JQH"
     out_path = os.fspath(out_path)
