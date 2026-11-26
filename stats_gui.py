@@ -4756,9 +4756,17 @@ class QQQuickFilterPanel(ttk.Frame):
                             continue
                     else:
                         win_files.add(full_path)
-                    x, y, z, w = r["deficit"]
-                    desc = (f"第{r['start']}步起，落后对手"
-                            f"{x}司令、{y}军长、{z}师长、{w}炸弹")
+                    judged = r.get("judged") or (0, 1, 2, 3)
+                    names = ("司令", "军长", "师长", "炸弹")
+                    parts = "、".join(
+                        f"{r['deficit'][i]}{names[i]}" for i in judged
+                        if r['deficit'][i] > 0)
+                    side = "".join(pal.display.get(c, c)
+                                   for c in r.get("side", ""))
+                    if parts:
+                        desc = f"第{r['start']}步起，{side}落后对手{parts}"
+                    else:
+                        desc = f"{side}全程未落后对手判定子力"
                     if is_loss:
                         desc += "（未翻盘）"
                     first = full_path not in shown_files

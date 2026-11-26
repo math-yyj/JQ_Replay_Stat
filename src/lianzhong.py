@@ -805,8 +805,18 @@ def find_jqh_comeback_games(
     series_a, peak_a = peak_of(side_a, side_b)
     series_b, peak_b = peak_of(side_b, side_a)
 
-    def start_of(series) -> int:
-        return next((s for s, v in series if any(x > 0 for x in v)), 0)
+    def start_of(series, peak) -> int:
+        # 起始步 = 判定类中"正值峰值"同时达峰的首步(零值类=从未落后,
+        # 不构成"落后"; 多类峰值不同步时退化为任一达峰首步)
+        judged = [i for i, lim in enumerate(limits)
+                  if lim is not None and peak[i] > 0]
+        for s, v in series:
+            if all(v[i] == peak[i] for i in judged):
+                return s
+        for s, v in series:
+            if any(v[i] == peak[i] for i in judged):
+                return s
+        return 0
 
     win_rows: list[dict] = []
     loss_rows: list[dict] = []
@@ -817,17 +827,24 @@ def find_jqh_comeback_games(
     else:
         win_series, win_peak = series_b, peak_b
         loss_series, loss_peak = series_a, peak_a
+    judged = tuple(i for i, lim in enumerate(limits) if lim is not None)
     if winners and matches(win_peak):
-        win_rows.append({"start": start_of(win_series), "deficit": win_peak,
-                         "winners": winners})
+        win_rows.append({"start": start_of(win_series, win_peak),
+                         "deficit": win_peak, "winners": winners,
+                         "side": "".join(sorted(winners)), "judged": judged})
     elif winners and matches(loss_peak):
-        loss_rows.append({"start": start_of(loss_series),
-                          "deficit": loss_peak, "loss": True})
+        losers = [c for c in colors if c not in winners]
+        loss_rows.append({"start": start_of(loss_series, loss_peak),
+                          "deficit": loss_peak, "loss": True,
+                          "side": "".join(sorted(losers)), "judged": judged})
     elif not winners:
-        for series_s, peak_s in ((series_a, peak_a), (series_b, peak_b)):
+        for side, series_s, peak_s in (
+                (side_a, series_a, peak_a), (side_b, series_b, peak_b)):
             if matches(peak_s):
-                loss_rows.append({"start": start_of(series_s),
-                                  "deficit": peak_s, "loss": True})
+                loss_rows.append({"start": start_of(series_s, peak_s),
+                                  "deficit": peak_s, "loss": True,
+                                  "side": "".join(sorted(side)),
+                                  "judged": judged})
     return win_rows, loss_rows
 
 
