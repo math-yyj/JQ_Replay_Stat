@@ -4390,10 +4390,12 @@ HINT_PIANZHA = (
 HINT_COMEBACK = (
     "劣势翻盘局：胜方联盟全程在 司令/军长/师长/炸弹 四类子力上的最大存活"
     "落后（敌方减己方）符合指定条件时命中，即该方在最劣势构成为指定值的"
-    "情况下仍获全胜。参数“-”=该类不参与判断，数字=最大落后恰为该值"
-    "（联盟编制上限：司/军≤2、师/弹≤4）。结果展示首次落后步号与最大落后"
-    "构成。复盘范围随全局平台选择（QQ .jgs / 联众 .jqh）。双击结果行打开"
-    "复盘，右键复制完整地址；同局各行操作均指向该复盘。")
+    "情况下仍获全胜。参数“-”=该类忽略不判，数字（含 0）=最大落后恰为"
+    "该值（联盟编制上限：司/军≤2、师/弹≤4）。勾选“显示未翻盘”则同时列出"
+    "该条件劣势局中落败的一方（描述带“未翻盘”），不勾选则隐藏。结果展示"
+    "首次落后步号与最大落后构成。复盘范围随全局平台选择（QQ .jgs / 联众 "
+    ".jqh）。双击结果行打开复盘，右键复制完整地址；同局各行操作均指向"
+    "该复盘。")
 
 
 class QQQuickFilterPanel(ttk.Frame):
@@ -4459,17 +4461,22 @@ class QQQuickFilterPanel(ttk.Frame):
         self.cb_w = tk.StringVar(value="-")
         ttk.Label(self.comeback_row, text="最大落后:").pack(side=tk.LEFT)
         for label, var, vals in (
-                ("司令", self.cb_x, ("-", "1", "2")),
-                ("军长", self.cb_y, ("-", "1", "2")),
-                ("师长", self.cb_z, ("-", "1", "2", "3", "4")),
-                ("炸弹", self.cb_w, ("-", "1", "2", "3", "4"))):
+                ("司令", self.cb_x, ("-", "0", "1", "2")),
+                ("军长", self.cb_y, ("-", "0", "1", "2")),
+                ("师长", self.cb_z, ("-", "0", "1", "2", "3", "4")),
+                ("炸弹", self.cb_w, ("-", "0", "1", "2", "3", "4"))):
             ttk.Label(self.comeback_row, text=label).pack(
                 side=tk.LEFT, padx=(8, 2))
             ttk.Spinbox(self.comeback_row, values=vals, width=3,
                         textvariable=var).pack(side=tk.LEFT)
         ttk.Label(self.comeback_row,
-                  text="（“-”=该类不参与判断，数字=最大落后恰为该值）").pack(
+                  text="（“-”=该类忽略，数字=最大落后恰为该值）").pack(
             side=tk.LEFT, padx=(8, 0))
+        self.cb_show_loss = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.comeback_row, text="显示未翻盘",
+                        variable=self.cb_show_loss,
+                        command=self._on_show_loss_toggle).pack(
+            side=tk.LEFT, padx=(12, 0))
 
         self.btn_row = ttk.Frame(top)
         self.btn_row.pack(fill=tk.X, padx=6, pady=(2, 2))
@@ -4533,6 +4540,11 @@ class QQQuickFilterPanel(ttk.Frame):
                 text=HINT_ZHUANGLING if key == "fake_general" else HINT_PIANZHA)
         self.clear_stats()
 
+    def _on_show_loss_toggle(self) -> None:
+        """勾选切换未翻盘行显隐: 直接按缓存结果重绘, 无需重扫。"""
+        if self._scan_result is not None:
+            self._poll_worker()
+
     def _start_scan(self) -> None:
         folder = self._folder_var.get().strip()
         if not folder or not Path(folder).is_dir():
@@ -4580,10 +4592,11 @@ class QQQuickFilterPanel(ttk.Frame):
                         for jqh_file in files:
                             try:
                                 raw = open(jqh_file, "rb").read()
-                                hits, cond = find_jqh_comeback_games(
+                                win_hits, loss_hits = find_jqh_comeback_games(
                                     raw, comeback_limits)
-                                cond_games += int(cond)
-                                for rec in hits:
+                                cond_games += int(bool(win_hits)
+                                                  or bool(loss_hits))
+                                for rec in win_hits + loss_hits:
                                     rows.append((jqh_file, rec))
                             except Exception:
                                 failed += 1
@@ -4596,10 +4609,11 @@ class QQQuickFilterPanel(ttk.Frame):
                         for jgs_file in files:
                             try:
                                 rep = parse_jgs(jgs_file)
-                                hits, cond = find_comeback_games(
+                                win_hits, loss_hits = find_comeback_games(
                                     rep, comeback_limits)
-                                cond_games += int(cond)
-                                for rec in hits:
+                                cond_games += int(bool(win_hits)
+                                                  or bool(loss_hits))
+                                for rec in win_hits + loss_hits:
                                     rows.append((jgs_file, rec))
                             except Exception:
                                 failed += 1
@@ -4727,16 +4741,30 @@ class QQQuickFilterPanel(ttk.Frame):
             return f"{side}方，{ev['a']}骗炸（{ev['y']}步）"
 
         hit_files = set()
+        win_files: set[str] = set()
+        loss_files: set[str] = set()
+        shown_files: set[str] = set()
         n_empty = 0
         for full_path, recs in grouped.items():
             hit_files.add(os.path.basename(full_path))
             for k, r in enumerate(recs):
                 if filter_key == "comeback":
+                    is_loss = bool(r.get("loss"))
+                    if is_loss:
+                        loss_files.add(full_path)
+                        if not self.cb_show_loss.get():
+                            continue
+                    else:
+                        win_files.add(full_path)
                     x, y, z, w = r["deficit"]
                     desc = (f"第{r['start']}步起，落后对手"
                             f"{x}司令、{y}军长、{z}师长、{w}炸弹")
-                    values = (os.path.basename(full_path) if k == 0 else "",
-                              desc, full_path if k == 0 else "")
+                    if is_loss:
+                        desc += "（未翻盘）"
+                    first = full_path not in shown_files
+                    shown_files.add(full_path)
+                    values = (os.path.basename(full_path) if first else "",
+                              desc, full_path if first else "")
                 elif filter_key in ("fake_general", "bomb_bait"):
                     values = (os.path.basename(full_path) if k == 0 else "",
                               fake_desc(r), full_path if k == 0 else "")
@@ -4760,13 +4788,16 @@ class QQQuickFilterPanel(ttk.Frame):
         if filter_key == "comeback":
             x, y, z, w = self.cb_x.get(), self.cb_y.get(), self.cb_z.get(), \
                 self.cb_w.get()
-            pct = (f"{100.0 * len(hit_files) / cond_games:.1f}%"
+            pct = (f"{100.0 * len(win_files) / cond_games:.1f}%"
                    if cond_games else "—")
             status = (f"范围[{platform_text}] 筛选[劣势翻盘局] "
                       f"条件[最大落后 {x}司令{y}军长{z}师长{w}炸弹] "
-                      f"扫描 {total} 局，命中 {len(hit_files)} 局"
+                      f"扫描 {total} 局，命中 {len(win_files)} 局"
                       f" · 该条件劣势局 {cond_games} 局"
                       f" · 翻盘占比 {pct}")
+            if loss_files:
+                state = "已显示" if self.cb_show_loss.get() else "已隐藏"
+                status += f"（未翻盘 {len(loss_files)} 局 {state}）"
         elif filter_key in ("fake_general", "bomb_bait"):
             name_text = "装令复盘" if filter_key == "fake_general" else "骗炸复盘"
             status = (f"范围[{platform_text}] 筛选[{name_text}] 扫描 {total} 局，"

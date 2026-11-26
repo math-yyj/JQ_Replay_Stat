@@ -1362,19 +1362,19 @@ COMEBACK_TYPES = (("司", int(ItemType.Silin)), ("军", int(ItemType.Junzhang)),
 def find_comeback_games(
     replay: QQReplay,
     limits: tuple[int | None, int | None, int | None, int | None],
-) -> tuple[list[dict], bool]:
+) -> tuple[list[dict], list[dict]]:
     """劣势翻盘局: 胜方联盟对败方联盟的四类子力存活落后全程最大值恰为 limits。
 
     落后(逐类) = 敌方联盟存活数 - 己方联盟存活数; "最大落后"取四类分量各自
     的全程最大(可能出现在不同时刻, 与参数域 X,Y∈[0,2]、Z,W∈[0,4] 的联盟
     编制上限自洽)。limits 中 None = 该类不参与判断。
-    返回 (rows, cond): rows 仅当胜方存在且参与判断分量均恰值时非空,
-    为 [{"start": 首次落后步, "deficit": 最大落后构成, "winners": 胜方}];
-    cond = 任一方(含败方)的最大落后符合条件——作翻盘占比的分母口径。
+    返回 (win_rows, loss_rows): win_rows = 胜方最大落后符合(翻盘),
+    loss_rows = 落后方未获胜(未翻盘, 含无胜方局, rec 带 "loss": True),
+    各局至多一类命中。两者任一非空即计"该条件劣势局"(翻盘占比分母)。
     """
     split = _team_split(replay.orient)
     if split is None:
-        return [], False
+        return [], []
     team_a, team_b = split
     analysis = replay.analyze()
     winners = list(analysis.winner) if analysis.winner else []
@@ -1427,17 +1427,30 @@ def find_comeback_games(
 
     series_a, peak_a = peak_of(team_a, team_b)
     series_b, peak_b = peak_of(team_b, team_a)
-    cond = matches(peak_a) or matches(peak_b)
-    if not winners:
-        return [], cond
+
+    def start_of(series) -> int:
+        return next((s for s, v in series if any(x > 0 for x in v)), 0)
+
+    win_rows: list[dict] = []
+    loss_rows: list[dict] = []
     if winners == team_a:
-        series, peak = series_a, peak_a
+        win_series, win_peak = series_a, peak_a
+        loss_series, loss_peak = series_b, peak_b
     else:
-        series, peak = series_b, peak_b
-    if not matches(peak):
-        return [], cond
-    start = next((s for s, v in series if any(x > 0 for x in v)), 0)
-    return [{"start": start, "deficit": peak, "winners": winners}], cond
+        win_series, win_peak = series_b, peak_b
+        loss_series, loss_peak = series_a, peak_a
+    if winners and matches(win_peak):
+        win_rows.append({"start": start_of(win_series), "deficit": win_peak,
+                         "winners": winners})
+    elif winners and matches(loss_peak):
+        loss_rows.append({"start": start_of(loss_series),
+                          "deficit": loss_peak, "loss": True})
+    elif not winners:
+        for series_s, peak_s in ((series_a, peak_a), (series_b, peak_b)):
+            if matches(peak_s):
+                loss_rows.append({"start": start_of(series_s),
+                                  "deficit": peak_s, "loss": True})
+    return win_rows, loss_rows
 
 
 def match_fake_general(traces: list[dict]) -> list[dict]:

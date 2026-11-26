@@ -753,13 +753,13 @@ COMEBACK_TYPES = ("司", "军", "师", "弹")
 def find_jqh_comeback_games(
     raw: bytes,
     limits: tuple[int | None, int | None, int | None, int | None],
-) -> tuple[list[dict], bool]:
+) -> tuple[list[dict], list[dict]]:
     """劣势翻盘局(联众口径): 胜方联盟四类子力存活落后全程最大值恰为 limits。
 
     落后(逐类) = 敌方联盟存活数 - 己方联盟存活数(步 = 行棋区条目序号,
     含 Pass/GiveUp, 与官方复盘器步号一致)。limits 中 None = 该类不参与判断。
-    返回 (rows, cond), 语义同 QQ 侧 find_comeback_games(分平台各自推演,
-    死亡结算语义不同)。
+    返回 (win_rows, loss_rows), 语义同 QQ 侧 find_comeback_games
+    (分平台各自推演, 死亡结算语义不同)。
     """
     eliminated: dict[str, str] = {}
     counts: list[tuple[int, dict[str, list[int]]]] = []
@@ -787,7 +787,7 @@ def find_jqh_comeback_games(
         side_a = [c for c in ("蓝", "红") if c in colors]
         side_b = [c for c in ("绿", "黑") if c in colors]
     if not side_a or not side_b:
-        return [], False
+        return [], []
 
     def peak_of(side, opp):
         def vec(cnt):
@@ -804,18 +804,31 @@ def find_jqh_comeback_games(
 
     series_a, peak_a = peak_of(side_a, side_b)
     series_b, peak_b = peak_of(side_b, side_a)
-    cond = matches(peak_a) or matches(peak_b)
+
+    def start_of(series) -> int:
+        return next((s for s, v in series if any(x > 0 for x in v)), 0)
+
+    win_rows: list[dict] = []
+    loss_rows: list[dict] = []
     winners, _text = determine_jqh_end_result(eliminated, colors)
-    if not winners:
-        return [], cond
-    if list(winners) == side_a:
-        series, peak = series_a, peak_a
+    if winners and list(winners) == side_a:
+        win_series, win_peak = series_a, peak_a
+        loss_series, loss_peak = series_b, peak_b
     else:
-        series, peak = series_b, peak_b
-    if not matches(peak):
-        return [], cond
-    start = next((s for s, v in series if any(x > 0 for x in v)), 0)
-    return [{"start": start, "deficit": peak, "winners": winners}], cond
+        win_series, win_peak = series_b, peak_b
+        loss_series, loss_peak = series_a, peak_a
+    if winners and matches(win_peak):
+        win_rows.append({"start": start_of(win_series), "deficit": win_peak,
+                         "winners": winners})
+    elif winners and matches(loss_peak):
+        loss_rows.append({"start": start_of(loss_series),
+                          "deficit": loss_peak, "loss": True})
+    elif not winners:
+        for series_s, peak_s in ((series_a, peak_a), (series_b, peak_b)):
+            if matches(peak_s):
+                loss_rows.append({"start": start_of(series_s),
+                                  "deficit": peak_s, "loss": True})
+    return win_rows, loss_rows
 
 
 def determine_jqh_end_result(
