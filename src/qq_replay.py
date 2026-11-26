@@ -1360,13 +1360,15 @@ COMEBACK_TYPES = (("司", int(ItemType.Silin)), ("军", int(ItemType.Junzhang)),
 
 
 def find_comeback_games(replay: QQReplay,
-                        limits: tuple[int, int, int, int]) -> list[dict]:
+                        limits: tuple[int | None, int | None, int | None,
+                                      int | None]) -> list[dict]:
     """劣势翻盘局: 胜方联盟对败方联盟的四类子力存活落后全程最大值恰为 limits。
 
     落后(逐类) = 敌方联盟存活数 - 己方联盟存活数; "最大落后"取四类分量各自
     的全程最大(可能出现在不同时刻, 与参数域 X,Y∈[0,2]、Z,W∈[0,4] 的联盟
-    编制上限自洽)。返回 [{"start": 首次落后步, "deficit": 最大落后构成,
-    "winners": 胜方}], 仅当胜方存在且最大落后恰为 limits 时非空。
+    编制上限自洽)。limits 中 None = 该类不参与判断。
+    返回 [{"start": 首次落后步, "deficit": 最大落后构成,
+    "winners": 胜方}], 仅当胜方存在且参与判断的分量均恰为指定值时非空。
     """
     analysis = replay.analyze()
     if not analysis.winner:
@@ -1415,7 +1417,8 @@ def find_comeback_games(replay: QQReplay,
         snap(item.no)
 
     peak = tuple(max(v[i] for _, v in series) for i in range(4))
-    if peak != tuple(limits):
+    if any(lim is not None and lim != peak[i]
+           for i, lim in enumerate(limits)):
         return []
     start = next((s for s, v in series if any(x > 0 for x in v)), 0)
     return [{"start": start, "deficit": peak, "winners": winners}]

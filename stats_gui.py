@@ -4389,10 +4389,11 @@ HINT_PIANZHA = (
     "各行操作均指向该复盘。")
 HINT_COMEBACK = (
     "劣势翻盘局：胜方联盟全程在 司令/军长/师长/炸弹 四类子力上的最大存活"
-    "落后（敌方减己方）恰为指定值（联盟编制上限：司/军≤2、师/弹≤4）时命中，"
-    "即该方在最劣势构成为指定值的情况下仍获全胜。结果展示首次落后步号与"
-    "最大落后构成。复盘范围随全局平台选择（QQ .jgs / 联众 .jqh）。双击结果"
-    "行打开复盘，右键复制完整地址；同局各行操作均指向该复盘。")
+    "落后（敌方减己方）符合指定条件时命中，即该方在最劣势构成为指定值的"
+    "情况下仍获全胜。参数“-”=该类不参与判断，数字=最大落后恰为该值"
+    "（联盟编制上限：司/军≤2、师/弹≤4）。结果展示首次落后步号与最大落后"
+    "构成。复盘范围随全局平台选择（QQ .jgs / 联众 .jqh）。双击结果行打开"
+    "复盘，右键复制完整地址；同局各行操作均指向该复盘。")
 
 
 class QQQuickFilterPanel(ttk.Frame):
@@ -4450,20 +4451,24 @@ class QQQuickFilterPanel(ttk.Frame):
             self.mode_row, text="最大仅吃到连长", value="max_lian",
             variable=self.mode_var).pack(side=tk.LEFT, padx=(12, 0))
 
-        # 劣势翻盘局参数: 四类子力最大落后恰为指定值(联盟编制上限)
+        # 劣势翻盘局参数: "-"=该类不参与判断, 数字=最大落后恰为该值
         self.comeback_row = ttk.Frame(top)
-        self.cb_x = tk.IntVar(value=0)
-        self.cb_y = tk.IntVar(value=0)
-        self.cb_z = tk.IntVar(value=0)
-        self.cb_w = tk.IntVar(value=0)
+        self.cb_x = tk.StringVar(value="-")
+        self.cb_y = tk.StringVar(value="-")
+        self.cb_z = tk.StringVar(value="-")
+        self.cb_w = tk.StringVar(value="-")
         ttk.Label(self.comeback_row, text="最大落后:").pack(side=tk.LEFT)
-        for label, var, hi in (("司令", self.cb_x, 2), ("军长", self.cb_y, 2),
-                               ("师长", self.cb_z, 4), ("炸弹", self.cb_w, 4)):
+        for label, var, vals in (
+                ("司令", self.cb_x, ("-", "1", "2")),
+                ("军长", self.cb_y, ("-", "1", "2")),
+                ("师长", self.cb_z, ("-", "1", "2", "3", "4")),
+                ("炸弹", self.cb_w, ("-", "1", "2", "3", "4"))):
             ttk.Label(self.comeback_row, text=label).pack(
                 side=tk.LEFT, padx=(8, 2))
-            ttk.Spinbox(self.comeback_row, from_=0, to=hi, width=3,
+            ttk.Spinbox(self.comeback_row, values=vals, width=3,
                         textvariable=var).pack(side=tk.LEFT)
-        ttk.Label(self.comeback_row, text="（四类最大落后恰为该值）").pack(
+        ttk.Label(self.comeback_row,
+                  text="（“-”=该类不参与判断，数字=最大落后恰为该值）").pack(
             side=tk.LEFT, padx=(8, 0))
 
         self.btn_row = ttk.Frame(top)
@@ -4540,8 +4545,24 @@ class QQQuickFilterPanel(ttk.Frame):
         is_lianzhong = self._source_var.get() == "联众"
         comeback_limits = None
         if filter_key == "comeback":
-            comeback_limits = (self.cb_x.get(), self.cb_y.get(),
-                               self.cb_z.get(), self.cb_w.get())
+            def _lim(var) -> int | None:
+                text = str(var.get()).strip()
+                return None if text in ("-", "") else int(text)
+
+            try:
+                comeback_limits = (_lim(self.cb_x), _lim(self.cb_y),
+                                   _lim(self.cb_z), _lim(self.cb_w))
+            except ValueError:
+                self.scan_btn.config(state=tk.NORMAL)
+                messagebox.showwarning(
+                    "提示", "最大落后参数须为 “-” 或数字", parent=self._top)
+                return
+            if all(v is None for v in comeback_limits):
+                self.scan_btn.config(state=tk.NORMAL)
+                messagebox.showwarning(
+                    "提示", "请至少选择一类子力参与判断（“-”=不参与）",
+                    parent=self._top)
+                return
         progress = [0]
         total_ref = [0]
 

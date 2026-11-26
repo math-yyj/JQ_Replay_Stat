@@ -751,12 +751,13 @@ COMEBACK_TYPES = ("司", "军", "师", "弹")
 
 
 def find_jqh_comeback_games(raw: bytes,
-                            limits: tuple[int, int, int, int]) -> list[dict]:
+                            limits: tuple[int | None, int | None, int | None,
+                                          int | None]) -> list[dict]:
     """劣势翻盘局(联众口径): 胜方联盟四类子力存活落后全程最大值恰为 limits。
 
     落后(逐类) = 敌方联盟存活数 - 己方联盟存活数(步 = 行棋区条目序号,
-    含 Pass/GiveUp, 与官方复盘器步号一致)。口径同 QQ 侧 find_comeback_games,
-    分平台各自推演(死亡结算语义不同)。
+    含 Pass/GiveUp, 与官方复盘器步号一致)。limits 中 None = 该类不参与判断。
+    口径同 QQ 侧 find_comeback_games, 分平台各自推演(死亡结算语义不同)。
     """
     eliminated: dict[str, str] = {}
     series: list[tuple[int, dict[str, list[int]]]] = []
@@ -791,7 +792,8 @@ def find_jqh_comeback_games(raw: bytes,
 
     series_v = [(step, vec_at(cnt)) for step, cnt in series]
     peak = tuple(max(v[i] for _, v in series_v) for i in range(4))
-    if peak != tuple(limits):
+    if any(lim is not None and lim != peak[i]
+           for i, lim in enumerate(limits)):
         return []
     start = next((s for s, v in series_v if any(x > 0 for x in v)), 0)
     return [{"start": start, "deficit": peak, "winners": winners}]
