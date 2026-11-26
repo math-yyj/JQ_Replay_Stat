@@ -4570,6 +4570,7 @@ class QQQuickFilterPanel(ttk.Frame):
             try:
                 rows = []
                 failed = 0
+                cond_games = 0
                 if filter_key == "comeback":
                     if is_lianzhong:
                         from src.lianzhong import find_jqh_comeback_games
@@ -4579,8 +4580,10 @@ class QQQuickFilterPanel(ttk.Frame):
                         for jqh_file in files:
                             try:
                                 raw = open(jqh_file, "rb").read()
-                                for rec in find_jqh_comeback_games(
-                                        raw, comeback_limits):
+                                hits, cond = find_jqh_comeback_games(
+                                    raw, comeback_limits)
+                                cond_games += int(cond)
+                                for rec in hits:
                                     rows.append((jqh_file, rec))
                             except Exception:
                                 failed += 1
@@ -4593,8 +4596,10 @@ class QQQuickFilterPanel(ttk.Frame):
                         for jgs_file in files:
                             try:
                                 rep = parse_jgs(jgs_file)
-                                for rec in find_comeback_games(
-                                        rep, comeback_limits):
+                                hits, cond = find_comeback_games(
+                                    rep, comeback_limits)
+                                cond_games += int(cond)
+                                for rec in hits:
                                     rows.append((jgs_file, rec))
                             except Exception:
                                 failed += 1
@@ -4657,9 +4662,9 @@ class QQQuickFilterPanel(ttk.Frame):
                             failed += 1
                         progress[0] += 1
                 self._scan_result = (rows, total_ref[0], failed, mode,
-                                     filter_key, None)
+                                     filter_key, None, cond_games)
             except Exception as e:
-                self._scan_result = ([], 0, 0, mode, filter_key, str(e))
+                self._scan_result = ([], 0, 0, mode, filter_key, str(e), 0)
 
         self._worker = threading.Thread(target=worker, daemon=True)
         self._worker.start()
@@ -4682,7 +4687,8 @@ class QQQuickFilterPanel(ttk.Frame):
         self.scan_btn.config(state=tk.NORMAL)
         if self._scan_result is None:
             return
-        rows, total, failed, mode, filter_key, err = self._scan_result
+        rows, total, failed, mode, filter_key, err, cond_games = \
+            self._scan_result
         if err:
             self.status_var.set(f"统计失败: {err}")
             messagebox.showerror("错误", err, parent=self._top)
@@ -4754,9 +4760,13 @@ class QQQuickFilterPanel(ttk.Frame):
         if filter_key == "comeback":
             x, y, z, w = self.cb_x.get(), self.cb_y.get(), self.cb_z.get(), \
                 self.cb_w.get()
+            pct = (f"{100.0 * len(hit_files) / cond_games:.1f}%"
+                   if cond_games else "—")
             status = (f"范围[{platform_text}] 筛选[劣势翻盘局] "
                       f"条件[最大落后 {x}司令{y}军长{z}师长{w}炸弹] "
-                      f"扫描 {total} 局，命中 {len(hit_files)} 局")
+                      f"扫描 {total} 局，命中 {len(hit_files)} 局"
+                      f" · 该条件劣势局 {cond_games} 局"
+                      f" · 翻盘占比 {pct}")
         elif filter_key in ("fake_general", "bomb_bait"):
             name_text = "装令复盘" if filter_key == "fake_general" else "骗炸复盘"
             status = (f"范围[{platform_text}] 筛选[{name_text}] 扫描 {total} 局，"

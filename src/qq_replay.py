@@ -1359,42 +1359,38 @@ COMEBACK_TYPES = (("司", int(ItemType.Silin)), ("军", int(ItemType.Junzhang)),
                   ("师", int(ItemType.Shizhang)), ("弹", int(ItemType.Zhadan)))
 
 
-def find_comeback_games(replay: QQReplay,
-                        limits: tuple[int | None, int | None, int | None,
-                                      int | None]) -> list[dict]:
+def find_comeback_games(
+    replay: QQReplay,
+    limits: tuple[int | None, int | None, int | None, int | None],
+) -> tuple[list[dict], bool]:
     """劣势翻盘局: 胜方联盟对败方联盟的四类子力存活落后全程最大值恰为 limits。
 
     落后(逐类) = 敌方联盟存活数 - 己方联盟存活数; "最大落后"取四类分量各自
     的全程最大(可能出现在不同时刻, 与参数域 X,Y∈[0,2]、Z,W∈[0,4] 的联盟
     编制上限自洽)。limits 中 None = 该类不参与判断。
-    返回 [{"start": 首次落后步, "deficit": 最大落后构成,
-    "winners": 胜方}], 仅当胜方存在且参与判断的分量均恰为指定值时非空。
+    返回 (rows, cond): rows 仅当胜方存在且参与判断分量均恰值时非空,
+    为 [{"start": 首次落后步, "deficit": 最大落后构成, "winners": 胜方}];
+    cond = 任一方(含败方)的最大落后符合条件——作翻盘占比的分母口径。
     """
-    analysis = replay.analyze()
-    if not analysis.winner:
-        return []
     split = _team_split(replay.orient)
     if split is None:
-        return []
+        return [], False
     team_a, team_b = split
-    winners = list(analysis.winner)
-    losers = [c for c in (team_a + team_b) if c not in winners]
-    if not losers:
-        return []
+    analysis = replay.analyze()
+    winners = list(analysis.winner) if analysis.winner else []
 
     board = dict(replay.board)
     alive = {color: True for color in COLOR_ORDER}
-    series: list[tuple[int, tuple[int, int, int, int]]] = []
+    counts: list[tuple[int, dict[str, list[int]]]] = []
 
     def snap(step: int) -> None:
-        cnt = {c: [0, 0, 0, 0] for c in winners + losers}
+        cnt: dict[str, list[int]] = {}
         for p in board.values():
             for i, (_, code) in enumerate(COMEBACK_TYPES):
                 if p.piece == code:
-                    cnt[p.color][i] += 1
-        series.append((step, tuple(
-            sum(cnt[c][i] for c in losers) - sum(cnt[c][i] for c in winners)
-            for i in range(4))))
+                    slot = cnt.setdefault(p.color, [0, 0, 0, 0])
+                    slot[i] += 1
+        counts.append((step, cnt))
 
     snap(0)
     for kind, item in replay.seq:
@@ -1416,12 +1412,32 @@ def find_comeback_games(replay: QQReplay,
                 _remove_all(board, died)
         snap(item.no)
 
-    peak = tuple(max(v[i] for _, v in series) for i in range(4))
-    if any(lim is not None and lim != peak[i]
-           for i, lim in enumerate(limits)):
-        return []
+    def peak_of(side: list[str], opp: list[str]):
+        def vec(cnt):
+            return tuple(sum(cnt.get(c, (0, 0, 0, 0))[i] for c in opp)
+                         - sum(cnt.get(c, (0, 0, 0, 0))[i] for c in side)
+                         for i in range(4))
+        series = [(step, vec(cnt)) for step, cnt in counts]
+        peak = tuple(max(v[i] for _, v in series) for i in range(4))
+        return series, peak
+
+    def matches(peak) -> bool:
+        return all(lim is None or lim == peak[i]
+                   for i, lim in enumerate(limits))
+
+    series_a, peak_a = peak_of(team_a, team_b)
+    series_b, peak_b = peak_of(team_b, team_a)
+    cond = matches(peak_a) or matches(peak_b)
+    if not winners:
+        return [], cond
+    if winners == team_a:
+        series, peak = series_a, peak_a
+    else:
+        series, peak = series_b, peak_b
+    if not matches(peak):
+        return [], cond
     start = next((s for s, v in series if any(x > 0 for x in v)), 0)
-    return [{"start": start, "deficit": peak, "winners": winners}]
+    return [{"start": start, "deficit": peak, "winners": winners}], cond
 
 
 def match_fake_general(traces: list[dict]) -> list[dict]:

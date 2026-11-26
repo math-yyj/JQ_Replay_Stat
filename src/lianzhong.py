@@ -750,27 +750,29 @@ def _walk(moves, cells, fn, camps, flag_cells, direction):
 COMEBACK_TYPES = ("司", "军", "师", "弹")
 
 
-def find_jqh_comeback_games(raw: bytes,
-                            limits: tuple[int | None, int | None, int | None,
-                                          int | None]) -> list[dict]:
+def find_jqh_comeback_games(
+    raw: bytes,
+    limits: tuple[int | None, int | None, int | None, int | None],
+) -> tuple[list[dict], bool]:
     """劣势翻盘局(联众口径): 胜方联盟四类子力存活落后全程最大值恰为 limits。
 
     落后(逐类) = 敌方联盟存活数 - 己方联盟存活数(步 = 行棋区条目序号,
     含 Pass/GiveUp, 与官方复盘器步号一致)。limits 中 None = 该类不参与判断。
-    口径同 QQ 侧 find_comeback_games, 分平台各自推演(死亡结算语义不同)。
+    返回 (rows, cond), 语义同 QQ 侧 find_comeback_games(分平台各自推演,
+    死亡结算语义不同)。
     """
     eliminated: dict[str, str] = {}
-    series: list[tuple[int, dict[str, list[int]]]] = []
+    counts: list[tuple[int, dict[str, list[int]]]] = []
     colors: set[str] = set()
 
     def snap(step: int, board) -> None:
         cnt: dict[str, list[int]] = {}
         for color, piece in board.values():
             colors.add(color)
-            slot = cnt.setdefault(color, [0, 0, 0, 0])
             if piece in COMEBACK_TYPES:
+                slot = cnt.setdefault(color, [0, 0, 0, 0])
                 slot[COMEBACK_TYPES.index(piece)] += 1
-        series.append((step, cnt))
+        counts.append((step, cnt))
 
     for no, board, ev in _jqh_replay_walk(raw):
         if ev and ev.get("cleared"):
@@ -778,25 +780,42 @@ def find_jqh_comeback_games(raw: bytes,
                 eliminated[color] = _cause
         snap(no, board)
 
+    if len(colors) == 2:
+        pair = sorted(colors)
+        side_a, side_b = [pair[0]], [pair[1]]
+    else:
+        side_a = [c for c in ("蓝", "红") if c in colors]
+        side_b = [c for c in ("绿", "黑") if c in colors]
+    if not side_a or not side_b:
+        return [], False
+
+    def peak_of(side, opp):
+        def vec(cnt):
+            return tuple(sum(cnt.get(c, (0, 0, 0, 0))[i] for c in opp)
+                         - sum(cnt.get(c, (0, 0, 0, 0))[i] for c in side)
+                         for i in range(4))
+        series = [(step, vec(cnt)) for step, cnt in counts]
+        peak = tuple(max(v[i] for _, v in series) for i in range(4))
+        return series, peak
+
+    def matches(peak) -> bool:
+        return all(lim is None or lim == peak[i]
+                   for i, lim in enumerate(limits))
+
+    series_a, peak_a = peak_of(side_a, side_b)
+    series_b, peak_b = peak_of(side_b, side_a)
+    cond = matches(peak_a) or matches(peak_b)
     winners, _text = determine_jqh_end_result(eliminated, colors)
     if not winners:
-        return []
-    losers = [c for c in colors if c not in winners]
-    if not losers:
-        return []
-
-    def vec_at(cnt: dict[str, list[int]]) -> tuple[int, int, int, int]:
-        return tuple(sum(cnt.get(c, (0, 0, 0, 0))[i] for c in losers)
-                     - sum(cnt.get(c, (0, 0, 0, 0))[i] for c in winners)
-                     for i in range(4))
-
-    series_v = [(step, vec_at(cnt)) for step, cnt in series]
-    peak = tuple(max(v[i] for _, v in series_v) for i in range(4))
-    if any(lim is not None and lim != peak[i]
-           for i, lim in enumerate(limits)):
-        return []
-    start = next((s for s, v in series_v if any(x > 0 for x in v)), 0)
-    return [{"start": start, "deficit": peak, "winners": winners}]
+        return [], cond
+    if list(winners) == side_a:
+        series, peak = series_a, peak_a
+    else:
+        series, peak = series_b, peak_b
+    if not matches(peak):
+        return [], cond
+    start = next((s for s, v in series if any(x > 0 for x in v)), 0)
+    return [{"start": start, "deficit": peak, "winners": winners}], cond
 
 
 def determine_jqh_end_result(
