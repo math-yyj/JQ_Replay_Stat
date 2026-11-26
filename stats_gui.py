@@ -4387,6 +4387,12 @@ HINT_PIANZHA = (
     "最大/并列最大者（不计雷/弹/旗），即命中。复盘范围随全局平台选择"
     "（QQ .jgs / 联众 .jqh）。双击结果行打开复盘，右键复制完整地址；同局"
     "各行操作均指向该复盘。")
+HINT_COMEBACK = (
+    "劣势翻盘局：胜方联盟全程在 司令/军长/师长/炸弹 四类子力上的最大存活"
+    "落后（敌方减己方）恰为指定值（联盟编制上限：司/军≤2、师/弹≤4）时命中，"
+    "即该方在最劣势构成为指定值的情况下仍获全胜。结果展示首次落后步号与"
+    "最大落后构成。复盘范围随全局平台选择（QQ .jgs / 联众 .jqh）。双击结果"
+    "行打开复盘，右键复制完整地址；同局各行操作均指向该复盘。")
 
 
 class QQQuickFilterPanel(ttk.Frame):
@@ -4428,6 +4434,10 @@ class QQQuickFilterPanel(ttk.Frame):
             row0, text="骗炸复盘筛选", value="bomb_bait",
             variable=self.filter_var,
             command=self._on_filter_change).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Radiobutton(
+            row0, text="劣势翻盘局", value="comeback",
+            variable=self.filter_var,
+            command=self._on_filter_change).pack(side=tk.LEFT, padx=(12, 0))
         # 新增筛选模式时在此追加 radio 项(值写入 filter_var)并配对应参数区/结果列
 
         self.mode_row = ttk.Frame(top)
@@ -4439,6 +4449,22 @@ class QQQuickFilterPanel(ttk.Frame):
         ttk.Radiobutton(
             self.mode_row, text="最大仅吃到连长", value="max_lian",
             variable=self.mode_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        # 劣势翻盘局参数: 四类子力最大落后恰为指定值(联盟编制上限)
+        self.comeback_row = ttk.Frame(top)
+        self.cb_x = tk.IntVar(value=0)
+        self.cb_y = tk.IntVar(value=0)
+        self.cb_z = tk.IntVar(value=0)
+        self.cb_w = tk.IntVar(value=0)
+        ttk.Label(self.comeback_row, text="最大落后:").pack(side=tk.LEFT)
+        for label, var, hi in (("司令", self.cb_x, 2), ("军长", self.cb_y, 2),
+                               ("师长", self.cb_z, 4), ("炸弹", self.cb_w, 4)):
+            ttk.Label(self.comeback_row, text=label).pack(
+                side=tk.LEFT, padx=(8, 2))
+            ttk.Spinbox(self.comeback_row, from_=0, to=hi, width=3,
+                        textvariable=var).pack(side=tk.LEFT)
+        ttk.Label(self.comeback_row, text="（四类最大落后恰为该值）").pack(
+            side=tk.LEFT, padx=(8, 0))
 
         self.btn_row = ttk.Frame(top)
         self.btn_row.pack(fill=tk.X, padx=6, pady=(2, 2))
@@ -4487,14 +4513,19 @@ class QQQuickFilterPanel(ttk.Frame):
     def _on_filter_change(self) -> None:
         """切换筛选模式: 参数区显隐与说明随模式更新(口径互斥, 清空结果)。"""
         key = self.filter_var.get()
-        if key != "empty_bomb":
-            self.mode_row.pack_forget()
-            self.hint_label.config(
-                text=HINT_ZHUANGLING if key == "fake_general" else HINT_PIANZHA)
-        else:
+        self.mode_row.pack_forget()
+        self.comeback_row.pack_forget()
+        if key == "empty_bomb":
             self.mode_row.pack(fill=tk.X, padx=6, pady=(2, 2),
                                before=self.btn_row)
             self.hint_label.config(text=HINT_EMPTY_BOMB)
+        elif key == "comeback":
+            self.comeback_row.pack(fill=tk.X, padx=6, pady=(2, 2),
+                                   before=self.btn_row)
+            self.hint_label.config(text=HINT_COMEBACK)
+        else:
+            self.hint_label.config(
+                text=HINT_ZHUANGLING if key == "fake_general" else HINT_PIANZHA)
         self.clear_stats()
 
     def _start_scan(self) -> None:
@@ -4507,6 +4538,10 @@ class QQQuickFilterPanel(ttk.Frame):
         mode = self.mode_var.get()
         filter_key = self.filter_var.get()
         is_lianzhong = self._source_var.get() == "联众"
+        comeback_limits = None
+        if filter_key == "comeback":
+            comeback_limits = (self.cb_x.get(), self.cb_y.get(),
+                               self.cb_z.get(), self.cb_w.get())
         progress = [0]
         total_ref = [0]
 
@@ -4514,7 +4549,36 @@ class QQQuickFilterPanel(ttk.Frame):
             try:
                 rows = []
                 failed = 0
-                if filter_key in ("fake_general", "bomb_bait"):
+                if filter_key == "comeback":
+                    if is_lianzhong:
+                        from src.lianzhong import find_jqh_comeback_games
+                        files = sorted(glob.glob(
+                            os.path.join(folder, "**", "*.jqh"), recursive=True))
+                        total_ref[0] = len(files)
+                        for jqh_file in files:
+                            try:
+                                raw = open(jqh_file, "rb").read()
+                                for rec in find_jqh_comeback_games(
+                                        raw, comeback_limits):
+                                    rows.append((jqh_file, rec))
+                            except Exception:
+                                failed += 1
+                            progress[0] += 1
+                    else:
+                        from src.layout_stats import find_jgs_files
+                        from src.qq_replay import find_comeback_games
+                        files = find_jgs_files(folder)
+                        total_ref[0] = len(files)
+                        for jgs_file in files:
+                            try:
+                                rep = parse_jgs(jgs_file)
+                                for rec in find_comeback_games(
+                                        rep, comeback_limits):
+                                    rows.append((jgs_file, rec))
+                            except Exception:
+                                failed += 1
+                            progress[0] += 1
+                elif filter_key in ("fake_general", "bomb_bait"):
                     # 装令=赚棋事件 / 骗炸=骗炸事件, 共用同一战况匹配器
                     want_kind = "赚棋" if filter_key == "fake_general" else "骗炸"
                     if is_lianzhong:
@@ -4606,7 +4670,7 @@ class QQQuickFilterPanel(ttk.Frame):
         platform_text = "联众" if self._source_var.get() == "联众" else "QQ"
         pal = LZ_PALETTE if platform_text == "联众" else QQ_PALETTE
 
-        if filter_key == "fake_general":
+        if filter_key in ("fake_general", "bomb_bait", "comeback"):
             cols = ("file", "event", "path")
             heads = ("文件", "事件描述", "详细地址")
             widths = (165, 640, 235)
@@ -4640,7 +4704,13 @@ class QQQuickFilterPanel(ttk.Frame):
         for full_path, recs in grouped.items():
             hit_files.add(os.path.basename(full_path))
             for k, r in enumerate(recs):
-                if filter_key in ("fake_general", "bomb_bait"):
+                if filter_key == "comeback":
+                    x, y, z, w = r["deficit"]
+                    desc = (f"第{r['start']}步起，落后对手"
+                            f"{x}司令、{y}军长、{z}师长、{w}炸弹")
+                    values = (os.path.basename(full_path) if k == 0 else "",
+                              desc, full_path if k == 0 else "")
+                elif filter_key in ("fake_general", "bomb_bait"):
                     values = (os.path.basename(full_path) if k == 0 else "",
                               fake_desc(r), full_path if k == 0 else "")
                 else:
@@ -4660,7 +4730,13 @@ class QQQuickFilterPanel(ttk.Frame):
                 self._row_paths[iid] = full_path
         ttk.Style(self).configure("Quick.Treeview", rowheight=22)
 
-        if filter_key in ("fake_general", "bomb_bait"):
+        if filter_key == "comeback":
+            x, y, z, w = self.cb_x.get(), self.cb_y.get(), self.cb_z.get(), \
+                self.cb_w.get()
+            status = (f"范围[{platform_text}] 筛选[劣势翻盘局] "
+                      f"条件[最大落后 {x}司令{y}军长{z}师长{w}炸弹] "
+                      f"扫描 {total} 局，命中 {len(hit_files)} 局")
+        elif filter_key in ("fake_general", "bomb_bait"):
             name_text = "装令复盘" if filter_key == "fake_general" else "骗炸复盘"
             status = (f"范围[{platform_text}] 筛选[{name_text}] 扫描 {total} 局，"
                       f"命中 {len(hit_files)} 局 / {len(rows)} 条事件")

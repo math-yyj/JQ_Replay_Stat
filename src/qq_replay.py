@@ -1355,6 +1355,72 @@ def trace_key_pieces(replay: QQReplay) -> list[dict]:
     return traces
 
 
+COMEBACK_TYPES = (("司", int(ItemType.Silin)), ("军", int(ItemType.Junzhang)),
+                  ("师", int(ItemType.Shizhang)), ("弹", int(ItemType.Zhadan)))
+
+
+def find_comeback_games(replay: QQReplay,
+                        limits: tuple[int, int, int, int]) -> list[dict]:
+    """劣势翻盘局: 胜方联盟对败方联盟的四类子力存活落后全程最大值恰为 limits。
+
+    落后(逐类) = 敌方联盟存活数 - 己方联盟存活数; "最大落后"取四类分量各自
+    的全程最大(可能出现在不同时刻, 与参数域 X,Y∈[0,2]、Z,W∈[0,4] 的联盟
+    编制上限自洽)。返回 [{"start": 首次落后步, "deficit": 最大落后构成,
+    "winners": 胜方}], 仅当胜方存在且最大落后恰为 limits 时非空。
+    """
+    analysis = replay.analyze()
+    if not analysis.winner:
+        return []
+    split = _team_split(replay.orient)
+    if split is None:
+        return []
+    team_a, team_b = split
+    winners = list(analysis.winner)
+    losers = [c for c in (team_a + team_b) if c not in winners]
+    if not losers:
+        return []
+
+    board = dict(replay.board)
+    alive = {color: True for color in COLOR_ORDER}
+    series: list[tuple[int, tuple[int, int, int, int]]] = []
+
+    def snap(step: int) -> None:
+        cnt = {c: [0, 0, 0, 0] for c in winners + losers}
+        for p in board.values():
+            for i, (_, code) in enumerate(COMEBACK_TYPES):
+                if p.piece == code:
+                    cnt[p.color][i] += 1
+        series.append((step, tuple(
+            sum(cnt[c][i] for c in losers) - sum(cnt[c][i] for c in winners)
+            for i in range(4))))
+
+    snap(0)
+    for kind, item in replay.seq:
+        if kind == "event":
+            if (item.code == 2 and item.b >= 5) or item.code == 3:
+                if item.color and alive.get(item.color):
+                    alive[item.color] = False
+                    _remove_all(board, item.color)
+        else:
+            move = Move(no=item.no, color=item.color, start=item.start,
+                        end=item.end, result=item.result, tag=item.tag)
+            resolved = resolve_move(move, board)
+            if resolved.flag_down and resolved.defender:
+                alive[resolved.defender] = False
+                _remove_all(board, resolved.defender)
+            for died in _post_move_judgment(board, item.color, replay,
+                                            alive, {}, item.no, apply=False):
+                alive[died] = False
+                _remove_all(board, died)
+        snap(item.no)
+
+    peak = tuple(max(v[i] for _, v in series) for i in range(4))
+    if peak != tuple(limits):
+        return []
+    start = next((s for s, v in series if any(x > 0 for x in v)), 0)
+    return [{"start": start, "deficit": peak, "winners": winners}]
+
+
 def match_fake_general(traces: list[dict]) -> list[dict]:
     """装令战术匹配: 先装大, 后在存活期内赚棋或骗炸。
 
